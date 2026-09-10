@@ -102,7 +102,6 @@ bot_chat_id = None
 is_shutting_down = False
 pending_emails = {}
 
-# 🔒 أقفال
 mail_lock = threading.Lock()
 worker_lock = threading.Lock()
 proxy_lock = threading.Lock()
@@ -474,16 +473,8 @@ def get_working_proxy(current_proxy=None):
         return random.choice(available) if available else None
 
 
-def get_proxy_for_account(index):
-    proxies = load_proxies()
-    if not proxies:
-        return None, 0
-    proxy_index = index % len(proxies)
-    return proxies[proxy_index], proxy_index
-
-
 # ============================================================
-# خدمات Mail.tm (مصححة للتعامل مع list)
+# خدمات Mail.tm (مصححة)
 # ============================================================
 mail_monitors = {}
 seen_messages = {}
@@ -550,13 +541,11 @@ def create_mail_account(email=None, password=None):
 
 def ensure_mail_account(email, password):
     """التأكد من وجود البريد"""
-    # 1. جرب تسجيل الدخول
     token = get_mail_token(email, password)
     if token:
         logger.info(f"✅ البريد {email} موجود")
         return True, token
     
-    # 2. لو مش موجود، أنشئه
     logger.info(f"🆕 محاولة إنشاء البريد: {email}")
     created_email, created_pass, success = create_mail_account(email, password)
     
@@ -564,7 +553,6 @@ def ensure_mail_account(email, password):
         logger.error(f"❌ فشل إنشاء البريد {email}")
         return False, None
     
-    # 3. جرب تسجيل الدخول تاني
     time.sleep(2)
     token = get_mail_token(email, password)
     if token:
@@ -613,11 +601,9 @@ def extract_code_from_mail(email_data):
     if not email_data:
         return None
     
-    # ✅ الحصول على النص (مع التعامل مع list)
     body_text = safe_str(email_data.get("text", ""))
     body_html = safe_str(email_data.get("html", ""))
     
-    # ✅ استخدام text أولاً (أوضح)
     full_text = ""
     if body_text.strip():
         full_text = body_text
@@ -627,10 +613,9 @@ def extract_code_from_mail(email_data):
     if not full_text:
         return None
     
-    # ✅ الأنماط المحدثة (تدعم صيغة SlotFruits)
     patterns = [
-        r"verification\s*code\s*[:\-]?\s*([0-9]{4,10})",   # "Verification code: 96420"
-        r"code\s*[:\-]?\s*([0-9]{4,10})",                   # "code: 96420"
+        r"verification\s*code\s*[:\-]?\s*([0-9]{4,10})",
+        r"code\s*[:\-]?\s*([0-9]{4,10})",
         r"رمز التحقق:\s*([0-9]{4,10})",
         r"كود التأكيد:\s*([0-9]{4,10})",
         r"verification.{0,50}?([0-9]{4,10})",
@@ -645,7 +630,6 @@ def extract_code_from_mail(email_data):
                 logger.info(f"✅ تم استخراج الكود: {code}")
                 return code
     
-    # fallback: أول رقم من 4-6 خانات
     numbers = re.findall(r'\b(\d{4,6})\b', full_text)
     if numbers:
         logger.info(f"✅ كود محتمل: {numbers[0]}")
@@ -758,8 +742,11 @@ def wait_for_code(email, password, timeout=180):
         
         elapsed = time.time() - start_time
         if elapsed > 60 and elapsed - last_retry > 60 and retry_attempts < 3:
-            logger.info(f"🔄 إعادة التسجيل لـ {email} (محاولة {retry_attempts+1})")
-            do_register(email, password)
+            logger.info(f"🔄 إعادة التسجيل لـ {email}")
+            try:
+                do_register(email, password)
+            except:
+                pass
             retry_attempts += 1
             last_retry = elapsed
         
@@ -770,7 +757,7 @@ def wait_for_code(email, password, timeout=180):
 
 
 # ============================================================
-# [تكملة الكود في الرسالة التالية - API اللعبة + AccountWorker]
+# [تكملة الكود في الرسالة التالية - API + AccountWorker]
 # ============================================================
 # ============================================================
 # API اللعبة
@@ -864,6 +851,86 @@ def do_login(email, password, proxy=None):
         return None, None, 0, 0, str(e)
 
 
+def check_account_exists_in_slotfruits(email, password, proxy=None):
+    """
+    التحقق من الحساب - 3 حالات:
+    - exists: True → تسجيل دخول ناجح
+    - needs_confirmation: True → الحساب موجود بس محتاج كود
+    - not_found: True → الحساب جديد
+    """
+    try:
+        url = f"{API_URL}/users/signupFaucetPayLogin"
+        payload = {"email": email, "password": password}
+        headers = {
+            "User-Agent": "okhttp/4.12.0",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+        }
+        
+        kw = {"headers": headers, "data": json.dumps(payload)}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+        
+        res = safe_request("POST", url, **kw)
+        
+        if not res:
+            return {"exists": False, "error": "لا يوجد استجابة من السيرفر"}
+        
+        try:
+            data = res.json()
+        except:
+            return {"exists": False, "error": f"رد غير صالح: {res.text[:100]}"}
+        
+        # ✅ الحالة ١: تسجيل دخول ناجح
+        user = data.get("user")
+        token = data.get("token")
+        
+        if user and token:
+            return {
+                "exists": True,
+                "token": token,
+                "user_id": user.get("_id"),
+                "balance": user.get("balance", 0),
+                "credits": user.get("credits", 0),
+                "message": "الحساب موجود"
+            }
+        
+        # ✅ الحالة ٢: محتاج تأكيد
+        if data.get("needsConfirmation") == True:
+            return {
+                "exists": False,
+                "needs_confirmation": True,
+                "email": data.get("email", email),
+                "message": data.get("msg", "الحساب يحتاج تأكيد")
+            }
+        
+        # ✅ الحالة ٣: حساب جديد
+        msg = data.get("msg", "") or data.get("message", "") or ""
+        msg_lower = msg.lower()
+        
+        if ("not found" in msg_lower or "not exist" in msg_lower or 
+            "register" in msg_lower or "invalid" in msg_lower or 
+            "user" in msg_lower):
+            return {
+                "exists": False,
+                "not_found": True,
+                "message": msg or "الحساب غير موجود"
+            }
+        
+        # حالة غير معروفة - نعتبرها حساب جديد
+        return {
+            "exists": False,
+            "not_found": True,
+            "message": msg or "حساب جديد"
+        }
+    
+    except Exception as e:
+        return {"exists": False, "error": str(e)}
+
+
 def do_confirm(email, code, proxy=None):
     """تأكيد الحساب بالكود"""
     try:
@@ -892,25 +959,6 @@ def do_confirm(email, code, proxy=None):
         return False, None, data.get("message", "فشل التأكيد")
     except Exception as e:
         return False, None, str(e)
-
-
-def check_account_exists_in_slotfruits(email, password, proxy=None):
-    """التحقق من وجود الحساب في SlotFruits"""
-    token, user_id, balance, credits, msg = do_login(email, password, proxy)
-    
-    if token:
-        return {
-            "exists": True,
-            "token": token,
-            "user_id": user_id,
-            "balance": balance,
-            "credits": credits,
-            "message": "الحساب موجود"
-        }
-    return {
-        "exists": False,
-        "message": msg
-    }
 
 
 def get_user_info(token, proxy=None):
@@ -1203,7 +1251,7 @@ class AccountWorker:
                 if USE_PROXIES and self.proxy:
                     self.session.proxies = {"http": self.proxy, "https": self.proxy}
                 
-                # محاولة تسجيل الدخول أولاً
+                # محاولة تسجيل الدخول
                 token, user_id, balance, credits, msg = do_login(
                     self.email, self.password, self.proxy
                 )
@@ -1229,7 +1277,7 @@ class AccountWorker:
                 
                 logger.warning(f"⚠️ محاولة {attempt+1}/3 فشلت: {msg}")
                 
-                # جرب التسجيل مرة واحدة فقط
+                # جرب التسجيل
                 if attempt == 0:
                     logger.info(f"🆕 محاولة تسجيل حساب جديد: {self.email}")
                     success, reg_msg = do_register(self.email, self.password, self.proxy)
@@ -1352,7 +1400,6 @@ class AccountWorker:
         if self.balance < MIN_WITHDRAW:
             return False
         
-        # التحقق من حالة البريد
         if not self.mail_ok:
             logger.warning(f"⚠️ لا يمكن السحب لـ {self.email}: البريد غير متاح")
             return False
@@ -1677,7 +1724,6 @@ class BotManager:
         start = page * ITEMS_PER_PAGE
         end = min(start + ITEMS_PER_PAGE, total_accounts)
         
-        # إحصائيات إضافية
         mail_ok_count = sum(1 for d in status['details'] if d['mail_ok'])
         mail_bad_count = total_accounts - mail_ok_count
         
@@ -1715,16 +1761,17 @@ bot_manager = BotManager()
 
 
 # ============================================================
-# دالة الإضافة الذكية
+# دالة الإضافة الذكية (المصححة - تدعم 3 حالات)
 # ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False):
     """
-    إضافة حساب - تتعامل مع الحالتين:
-    - حساب موجود في SlotFruits → تسجيل دخول فقط
-    - حساب جديد → تسجيل كامل + كود + تأكيد
+    إضافة حساب - تتعامل مع الحالات الثلاث:
+    - حساب موجود (do_login نجح) → تسجيل دخول فقط
+    - needs_confirmation → طلب كود جديد وتأكيده
+    - not_found → تسجيل حساب جديد كامل
     """
     try:
-        # ========== الخطوة 1: جلب بروكسي ==========
+        # ========== جلب بروكسي ==========
         proxies = load_proxies()
         proxy = None
         proxy_index = 0
@@ -1733,14 +1780,11 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
             proxy_index = account_count % len(proxies)
             proxy = proxies[proxy_index]
         
-        # ============================================================
-        # الخطوة 2: التحقق من وجود الحساب في SlotFruits
-        # ============================================================
+        # ========== التحقق من الحساب ==========
         if progress_msg:
             try:
                 await progress_msg.edit_text(
-                    f"🔍 <b>التحقق من الحساب...</b>\n"
-                    f"📧 {email}",
+                    f"🔍 <b>التحقق من الحساب...</b>\n📧 {email}",
                     parse_mode="HTML"
                 )
             except:
@@ -1748,25 +1792,26 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
         
         account_check = check_account_exists_in_slotfruits(email, password, proxy)
         
+        logger.info(f"📊 نتيجة التحقق: {account_check}")
+        
         # ============================================================
         # الحالة ١: الحساب موجود → تسجيل دخول فقط
         # ============================================================
-        if account_check["exists"]:
-            logger.info(f"✅ الحساب {email} موجود، تسجيل دخول مباشر")
+        if account_check.get("exists"):
+            logger.info(f"✅ الحساب {email} موجود")
             
             if progress_msg:
                 try:
                     await progress_msg.edit_text(
                         f"✅ <b>الحساب موجود!</b>\n"
                         f"📧 {email}\n"
-                        f"💰 الرصيد: {account_check['balance']:,.0f}\n\n"
-                        f"📬 جاري فحص البريد (للسحب)...",
+                        f"💰 الرصيد: {account_check.get('balance', 0):,.0f}\n\n"
+                        f"📬 جاري فحص البريد...",
                         parse_mode="HTML"
                     )
                 except:
                     pass
             
-            # محاولة التحقق من البريد (بدون فشل الإضافة)
             mail_ok = False
             try:
                 mail_success, mail_token = ensure_mail_account(email, password)
@@ -1779,16 +1824,15 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
             except Exception as e:
                 logger.error(f"خطأ في التحقق من البريد: {e}")
             
-            # حفظ/تحديث الحساب
             existing = get_account_by_email(email)
             
             if existing:
                 update_account(
                     existing['id'],
-                    token=account_check["token"],
-                    user_id=account_check["user_id"],
-                    balance=account_check["balance"],
-                    credits=account_check["credits"],
+                    token=account_check.get("token"),
+                    user_id=account_check.get("user_id"),
+                    balance=account_check.get("balance", 0),
+                    credits=account_check.get("credits", 0),
                     last_login=datetime.now().isoformat(),
                     is_active=1,
                     proxy=proxy,
@@ -1801,10 +1845,10 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
             else:
                 account_id = add_account(
                     email, password,
-                    account_check["token"],
-                    account_check["user_id"],
-                    account_check["balance"],
-                    account_check["credits"],
+                    account_check.get("token"),
+                    account_check.get("user_id"),
+                    account_check.get("balance", 0),
+                    account_check.get("credits", 0),
                     proxy, proxy_index,
                     mail_ok=1 if mail_ok else 0,
                     account_type='existing'
@@ -1815,31 +1859,28 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
                 bot_manager.start_account(account_id)
                 
                 if progress_msg and not silent:
-                    if mail_ok:
-                        try:
+                    try:
+                        if mail_ok:
                             await progress_msg.edit_text(
                                 f"✅ <b>تم {action} الحساب بنجاح!</b>\n"
                                 f"━━━━━━━━━━━━━━━━━\n"
                                 f"🆔 ID: {account_id}\n"
                                 f"📧 {email}\n"
-                                f"💰 الرصيد: {account_check['balance']:,.0f}\n"
-                                f"🎯 الكريدت: {account_check['credits']}\n"
+                                f"💰 الرصيد: {account_check.get('balance', 0):,.0f}\n"
+                                f"🎯 الكريدت: {account_check.get('credits', 0)}\n"
                                 f"📬 البريد: ✅ شغال\n"
                                 f"💸 السحب: ✅ متاح\n"
                                 f"🌐 بروكسي: <code>{proxy or 'بدون'}</code>",
                                 parse_mode="HTML"
                             )
-                        except:
-                            pass
-                    else:
-                        try:
+                        else:
                             await progress_msg.edit_text(
                                 f"✅ <b>تم {action} الحساب</b>\n"
                                 f"━━━━━━━━━━━━━━━━━\n"
                                 f"🆔 ID: {account_id}\n"
                                 f"📧 {email}\n"
-                                f"💰 الرصيد: {account_check['balance']:,.0f}\n"
-                                f"🎯 الكريدت: {account_check['credits']}\n"
+                                f"💰 الرصيد: {account_check.get('balance', 0):,.0f}\n"
+                                f"🎯 الكريدت: {account_check.get('credits', 0)}\n"
                                 f"📬 البريد: ❌ غير متاح\n"
                                 f"💸 السحب: ❌ غير متاح\n"
                                 f"🌐 بروكسي: <code>{proxy or 'بدون'}</code>\n"
@@ -1850,179 +1891,333 @@ async def add_single_account(email, password, progress_msg=None, silent=False):
                                 f"تأكد من الباسورد أو أنشئ بريد جديد",
                                 parse_mode="HTML"
                             )
-                        except:
-                            pass
+                    except:
+                        pass
                 return True
         
         # ============================================================
-        # الحالة ٢: الحساب جديد → تسجيل كامل
+        # الحالة ٢: محتاج تأكيد (الحساب اتعمل بس محتاج كود)
         # ============================================================
-        logger.info(f"🆕 الحساب {email} جديد، بدء التسجيل...")
-        
-        if progress_msg:
-            try:
-                await progress_msg.edit_text(
-                    f"🆕 <b>حساب جديد</b>\n"
-                    f"📧 {email}\n\n"
-                    f"📬 جاري التحقق من البريد...",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-        
-        # التحقق من البريد أولاً (إجباري)
-        mail_ok, mail_token = ensure_mail_account(email, password)
-        
-        if not mail_ok:
-            if progress_msg and not silent:
-                try:
-                    await progress_msg.edit_text(
-                        f"❌ <b>فشل التحقق من البريد!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━\n"
-                        f"📧 {email}\n\n"
-                        f"⚠️ <b>الحساب جديد ويحتاج البريد لـ:</b>\n"
-                        f"• استقبال كود التأكيد\n"
-                        f"• استقبال أكواد السحب\n\n"
-                        f"💡 <b>الحلول:</b>\n"
-                        f"1. تأكد من أن البريد صحيح\n"
-                        f"2. تأكد من كلمة المرور\n"
-                        f"3. جرب مرة أخرى",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-            return False
-        
-        # بدء مراقبة البريد
-        start_mail_monitor(email, password)
-        
-        if progress_msg:
-            try:
-                await progress_msg.edit_text(
-                    f"🆕 <b>حساب جديد</b>\n"
-                    f"📧 {email}\n\n"
-                    f"✅ البريد جاهز\n"
-                    f"🔄 جاري التسجيل في SlotFruits...",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-        
-        # التسجيل في SlotFruits
-        success, reg_msg = do_register(email, password, proxy)
-        
-        if not success:
-            if progress_msg and not silent:
-                try:
-                    await progress_msg.edit_text(
-                        f"❌ <b>فشل التسجيل في SlotFruits</b>\n"
-                        f"📧 {email}\n"
-                        f"⚠️ {reg_msg}",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-            return False
-        
-        # انتظار الكود
-        if progress_msg:
-            try:
-                await progress_msg.edit_text(
-                    f"🆕 <b>حساب جديد</b>\n"
-                    f"📧 {email}\n\n"
-                    f"✅ تم التسجيل\n"
-                    f"📬 انتظار كود التأكيد (حتى 180 ثانية)...",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-        
-        code = wait_for_code(email, password, timeout=180)
-        
-        if not code:
-            if progress_msg and not silent:
-                try:
-                    await progress_msg.edit_text(
-                        f"❌ <b>انتهى وقت انتظار الكود</b>\n"
-                        f"━━━━━━━━━━━━━━━━━\n"
-                        f"📧 {email}\n\n"
-                        f"⚠️ <b>الأسباب المحتملة:</b>\n"
-                        f"• الكود لم يصل بعد\n"
-                        f"• البريد لا يستقبل\n"
-                        f"• SlotFruits لم ترسل\n\n"
-                        f"💡 جرب مرة أخرى",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-            return False
-        
-        if progress_msg:
-            try:
-                await progress_msg.edit_text(
-                    f"✅ <b>تم استلام الكود!</b>\n"
-                    f"📧 {email}\n"
-                    f"🔑 الكود: <code>{code}</code>\n\n"
-                    f"🔄 جاري تأكيد الحساب...",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-        
-        # تأكيد الحساب
-        success, token, confirm_msg = do_confirm(email, code, proxy)
-        
-        if not success:
-            if progress_msg and not silent:
-                try:
-                    await progress_msg.edit_text(
-                        f"❌ <b>فشل تأكيد الحساب</b>\n"
-                        f"📧 {email}\n"
-                        f"⚠️ {confirm_msg}",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-            return False
-        
-        # جلب معلومات المستخدم
-        user_info = get_user_info(token, proxy)
-        if user_info:
-            user_id_api = user_info.get("_id")
-            balance = user_info.get("balance", 0)
-            credits = user_info.get("credits", 0)
-        else:
-            user_id_api = None
-            balance = 0
-            credits = 0
-        
-        # حفظ الحساب
-        account_id = add_account(
-            email, password, token, user_id_api, balance, credits, 
-            proxy, proxy_index, mail_ok=1, account_type='new'
-        )
-        
-        if account_id:
-            bot_manager.start_account(account_id)
+        if account_check.get("needs_confirmation"):
+            logger.info(f"⚠️ الحساب {email} محتاج تأكيد")
             
-            if progress_msg and not silent:
+            if progress_msg:
                 try:
                     await progress_msg.edit_text(
-                        f"✅ <b>تم إنشاء الحساب بنجاح!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━\n"
-                        f"🆔 ID: {account_id}\n"
-                        f"📧 {email}\n"
-                        f"💰 الرصيد: {balance:,.0f}\n"
-                        f"🎯 الكريدت: {credits}\n"
-                        f"📬 البريد: ✅ شغال\n"
-                        f"💸 السحب: ✅ متاح\n"
-                        f"🌐 بروكسي: <code>{proxy or 'بدون'}</code>",
+                        f"⚠️ <b>الحساب مسجل بس محتاج تأكيد</b>\n"
+                        f"📧 {email}\n\n"
+                        f"📬 جاري التحقق من البريد...",
                         parse_mode="HTML"
                     )
                 except:
                     pass
-            return True
+            
+            mail_ok, mail_token = ensure_mail_account(email, password)
+            
+            if not mail_ok:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>فشل التحقق من البريد!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━\n"
+                            f"📧 {email}\n\n"
+                            f"⚠️ البريد مطلوب لاستقبال الكود\n\n"
+                            f"💡 تأكد من:\n"
+                            f"• الإيميل صحيح\n"
+                            f"• الباسورد صحيح\n"
+                            f"• Mail.tm شغال",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            start_mail_monitor(email, password)
+            
+            # طلب كود جديد
+            logger.info(f"🔄 طلب كود تأكيد جديد لـ {email}")
+            do_register(email, password, proxy)
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"⚠️ <b>الحساب مسجل بس محتاج تأكيد</b>\n"
+                        f"📧 {email}\n\n"
+                        f"✅ البريد جاهز\n"
+                        f"📬 انتظار الكود (حتى 180 ثانية)...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            code = wait_for_code(email, password, timeout=180)
+            
+            if not code:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>انتهى وقت الانتظار</b>\n"
+                            f"📧 {email}\n\n"
+                            f"⚠️ لم يصل الكود على البريد",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"✅ <b>تم استلام الكود!</b>\n"
+                        f"📧 {email}\n"
+                        f"🔑 الكود: <code>{code}</code>\n\n"
+                        f"🔄 جاري تأكيد الحساب...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            success, token, confirm_msg = do_confirm(email, code, proxy)
+            
+            if not success:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>فشل التأكيد</b>\n"
+                            f"📧 {email}\n"
+                            f"⚠️ {confirm_msg}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            user_info = get_user_info(token, proxy)
+            if user_info:
+                user_id_api = user_info.get("_id")
+                balance = user_info.get("balance", 0)
+                credits = user_info.get("credits", 0)
+            else:
+                user_id_api = None
+                balance = 0
+                credits = 0
+            
+            existing = get_account_by_email(email)
+            
+            if existing:
+                update_account(
+                    existing['id'],
+                    token=token,
+                    user_id=user_id_api,
+                    balance=balance,
+                    credits=credits,
+                    last_login=datetime.now().isoformat(),
+                    is_active=1,
+                    proxy=proxy,
+                    proxy_index=proxy_index,
+                    mail_ok=1,
+                    account_type='confirmed'
+                )
+                account_id = existing['id']
+                action = "تأكيد"
+            else:
+                account_id = add_account(
+                    email, password, token, user_id_api, balance, credits,
+                    proxy, proxy_index, mail_ok=1, account_type='confirmed'
+                )
+                action = "إنشاء"
+            
+            if account_id:
+                bot_manager.start_account(account_id)
+                
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"✅ <b>تم {action} الحساب بنجاح!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━\n"
+                            f"🆔 ID: {account_id}\n"
+                            f"📧 {email}\n"
+                            f"💰 الرصيد: {balance:,.0f}\n"
+                            f"📬 البريد: ✅ شغال\n"
+                            f"💸 السحب: ✅ متاح\n"
+                            f"🌐 بروكسي: <code>{proxy or 'بدون'}</code>",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return True
+            
+            return False
         
+        # ============================================================
+        # الحالة ٣: حساب جديد (not_found)
+        # ============================================================
+        if account_check.get("not_found"):
+            logger.info(f"🆕 الحساب {email} جديد، بدء التسجيل...")
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"🆕 <b>حساب جديد</b>\n"
+                        f"📧 {email}\n\n"
+                        f"📬 جاري التحقق من البريد...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            mail_ok, mail_token = ensure_mail_account(email, password)
+            
+            if not mail_ok:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>فشل التحقق من البريد!</b>\n"
+                            f"📧 {email}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            start_mail_monitor(email, password)
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"🆕 <b>حساب جديد</b>\n"
+                        f"📧 {email}\n\n"
+                        f"✅ البريد جاهز\n"
+                        f"🔄 جاري التسجيل...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            success, reg_msg = do_register(email, password, proxy)
+            
+            if not success:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>فشل التسجيل</b>\n"
+                            f"📧 {email}\n"
+                            f"⚠️ {reg_msg}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"🆕 <b>حساب جديد</b>\n"
+                        f"📧 {email}\n\n"
+                        f"✅ تم التسجيل\n"
+                        f"📬 انتظار الكود (حتى 180 ثانية)...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            code = wait_for_code(email, password, timeout=180)
+            
+            if not code:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>انتهى وقت الانتظار</b>\n"
+                            f"📧 {email}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            if progress_msg:
+                try:
+                    await progress_msg.edit_text(
+                        f"✅ <b>تم استلام الكود!</b>\n"
+                        f"📧 {email}\n"
+                        f"🔑 الكود: <code>{code}</code>\n\n"
+                        f"🔄 جاري التأكيد...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            success, token, confirm_msg = do_confirm(email, code, proxy)
+            
+            if not success:
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>فشل التأكيد</b>\n"
+                            f"📧 {email}\n"
+                            f"⚠️ {confirm_msg}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            user_info = get_user_info(token, proxy)
+            if user_info:
+                user_id_api = user_info.get("_id")
+                balance = user_info.get("balance", 0)
+                credits = user_info.get("credits", 0)
+            else:
+                user_id_api = None
+                balance = 0
+                credits = 0
+            
+            account_id = add_account(
+                email, password, token, user_id_api, balance, credits,
+                proxy, proxy_index, mail_ok=1, account_type='new'
+            )
+            
+            if account_id:
+                bot_manager.start_account(account_id)
+                
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"✅ <b>تم إنشاء الحساب بنجاح!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━\n"
+                            f"🆔 ID: {account_id}\n"
+                            f"📧 {email}\n"
+                            f"💰 الرصيد: {balance:,.0f}\n"
+                            f"🎯 الكريدت: {credits}\n"
+                            f"📬 البريد: ✅ شغال\n"
+                            f"💸 السحب: ✅ متاح\n"
+                            f"🌐 بروكسي: <code>{proxy or 'بدون'}</code>",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return True
+            
+            return False
+        
+        # ============================================================
+        # حالة غير معروفة (error)
+        # ============================================================
+        error_msg = account_check.get("error") or account_check.get("message") or "غير معروف"
+        
+        if progress_msg and not silent:
+            try:
+                await progress_msg.edit_text(
+                    f"❌ <b>خطأ غير معروف</b>\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"📧 {email}\n"
+                    f"⚠️ {error_msg}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        
+        logger.error(f"❌ حالة غير معروفة لـ {email}: {account_check}")
         return False
     
     except Exception as e:
@@ -2180,7 +2375,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "مثال: <code>user@uberip.com MyPass123</code>\n\n"
             "💡 <b>ملاحظة:</b>\n"
             "• لو الحساب موجود → تسجيل دخول\n"
-            "• لو جديد → إنشاء حساب تلقائياً\n\n"
+            "• لو محتاج تأكيد → إرسال كود جديد\n"
+            "• لو جديد → إنشاء حساب كامل\n\n"
             "🔙 لإلغاء العملية أرسل /cancel",
             parse_mode="HTML"
         )
@@ -2774,7 +2970,8 @@ def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print("📧 مراقبة البريد: مفعل (مع إصلاح list)")
-    print("🔍 التحقق الذكي (موجود/جديد): مفعل")
+    print("🔍 التحقق الذكي (3 حالات): مفعل")
+    print("📬 دعم needs_confirmation: مفعل")
     print("💰 السحب التلقائي: مفعل")
     print("💰 السحب اليدوي: مفعل")
     print("🌐 البروكسيات: ثابتة + تتغير عند الفشل")
