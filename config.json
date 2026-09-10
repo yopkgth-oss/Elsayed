@@ -5,6 +5,9 @@
   "mail_tm_domain": "@uberip.com",
   "timeout": 30,
   "min_withdraw": 1000,
+  "min_target": 55000,
+  "max_target": 65000,
   "use_proxies": true,
-  "database_file": "accounts.db"
+  "database_file": "accounts.db",
+  "items_per_page": 25
 }
