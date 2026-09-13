@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Slot Bot - النسخة النهائية الكاملة (معدلة)
-التعديلات الجديدة:
-- ✅ allow_old في wait_for_code (للتحقق من الحساب)
-- ✅ فحص بروكسي إجباري قبل السحب
-- ✅ إصلاح asyncio في المتعدد
-- ✅ تقليل timeout safe_request
+Slot Bot - النسخة النهائية
+- wait_for_code: للسحب (الكود الجديد فقط)
+- wait_for_code_registration: للتحقق (بيقبل الكود القديم)
+- start_mail_monitor مع skip_existing (يتجاهل الرسائل القديمة)
+- مفيش clear_old_slotfruits_messages
 """
 
 import os
@@ -32,18 +31,13 @@ import warnings
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-# ============================================================
-# إعدادات السجلات
-# ============================================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# تحميل الإعدادات
-# ============================================================
+
 def load_config():
     config_file = "config.json"
     default_config = {
@@ -119,9 +113,6 @@ FAKE_NUMBERS = {
     "5555", "6666", "7777", "8888", "9999"
 }
 
-# ============================================================
-# متغيرات عامة
-# ============================================================
 bot_application = None
 bot_chat_id = None
 main_event_loop = None
@@ -137,9 +128,7 @@ ip_cache = {}
 proxy_failures = {}
 coin_id_cache = {}
 
-# ============================================================
-# إشعار آمن من أي thread
-# ============================================================
+
 def safe_notify(message):
     global main_event_loop
     if not bot_application or not main_event_loop:
@@ -159,9 +148,7 @@ def safe_notify(message):
     except Exception as e:
         logger.error(f"فشل إرسال الإشعار: {e}")
 
-# ============================================================
-# قاعدة البيانات
-# ============================================================
+
 def init_database():
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
@@ -372,9 +359,6 @@ def add_spin(account_id, spin_number, reward, balance, credits):
     except:
         return False
         
-# ============================================================
-# نظام البروكسيات
-# ============================================================
 def load_proxies(proxy_file="proxy.txt"):
     proxies = []
     if not os.path.exists(proxy_file):
@@ -701,55 +685,6 @@ def get_mail_message(token, message_id):
         return None
 
 
-def clear_old_slotfruits_messages(email, password):
-    try:
-        token = get_mail_token(email, password)
-        if not token:
-            return False
-        
-        messages = get_mail_messages(token, limit=30)
-        if not messages:
-            return True
-        
-        cleared_count = 0
-        
-        with mail_lock:
-            if email not in seen_messages:
-                seen_messages[email] = set()
-            
-            for msg in messages:
-                msg_id = msg.get("id")
-                if not msg_id:
-                    continue
-                
-                subject = safe_str(msg.get("subject", ""))
-                from_addr = msg.get("from", {})
-                if isinstance(from_addr, dict):
-                    from_addr = from_addr.get("address", "")
-                from_addr = safe_str(from_addr)
-                
-                subject_lower = subject.lower()
-                from_lower = from_addr.lower()
-                
-                if ("slotfruits" in from_lower or 
-                    "slotfruits" in subject_lower or
-                    "withdrawal" in subject_lower or
-                    "verification" in subject_lower or
-                    "faucetpay" in from_lower or
-                    "faucetpay" in subject_lower):
-                    
-                    if msg_id not in seen_messages[email]:
-                        seen_messages[email].add(msg_id)
-                        cleared_count += 1
-        
-        logger.info(f"🧹 تم تجاهل {cleared_count} رسالة قديمة لـ {email}")
-        return True
-    
-    except Exception as e:
-        logger.error(f"خطأ في clear_old_slotfruits_messages: {e}")
-        return False
-
-
 def extract_code_from_mail(email_data, expected_amount=None):
     if not email_data:
         return None
@@ -854,7 +789,10 @@ def extract_code_from_mail(email_data, expected_amount=None):
     return None
 
 
-def start_mail_monitor(email, password):
+# ============================================================
+# ✅ start_mail_monitor مع skip_existing
+# ============================================================
+def start_mail_monitor(email, password, skip_existing=True):
     with mail_lock:
         if email in mail_monitors and mail_monitors[email].get("running", False):
             return mail_monitors[email].get("token")
@@ -866,6 +804,19 @@ def start_mail_monitor(email, password):
         
         if email not in seen_messages:
             seen_messages[email] = set()
+        
+        # ✅ سجل الرسائل الموجودة حالياً (عشان نتجاهلها)
+        if skip_existing:
+            try:
+                existing = get_mail_messages(token, limit=30)
+                if existing:
+                    for msg in existing:
+                        msg_id = msg.get("id")
+                        if msg_id:
+                            seen_messages[email].add(msg_id)
+                    logger.info(f"📬 تم تسجيل {len(existing)} رسالة موجودة (لتجاهلها)")
+            except Exception as e:
+                logger.error(f"خطأ في تسجيل الرسائل الموجودة: {e}")
         
         mail_monitors[email] = {
             "token": token,
@@ -960,17 +911,13 @@ def start_mail_monitor(email, password):
 
 
 # ============================================================
-# ✅ الدالة المعدلة: wait_for_code مع allow_old
+# ✅ دالتين منفصلتين: للسحب (wait_for_code) وللتحقق (wait_for_code_registration)
 # ============================================================
-def wait_for_code(email, password, timeout=180, expected_amount=None, allow_old=False):
-    """
-    انتظر كود التحقق من البريد
-    
-    allow_old=True  → اقبل الكود القديم (للتحقق من الحساب)
-    allow_old=False → اقبل الكود الجديد فقط (للسحب)
-    """
+
+def wait_for_code(email, password, timeout=180, expected_amount=None):
+    """انتظر كود التحقق — للسحب فقط (الكود الجديد)"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
-        token = start_mail_monitor(email, password)
+        token = start_mail_monitor(email, password, skip_existing=True)
         if not token:
             return None
     
@@ -978,8 +925,7 @@ def wait_for_code(email, password, timeout=180, expected_amount=None, allow_old=
         if email in mail_monitors:
             mail_monitors[email]["expected_amount"] = expected_amount
         
-        # لو allow_old=False، امسح الأكواد القديمة
-        if not allow_old and email in verification_codes:
+        if email in verification_codes:
             del verification_codes[email]
     
     wait_start_time = time.time()
@@ -991,17 +937,12 @@ def wait_for_code(email, password, timeout=180, expected_amount=None, allow_old=
         with mail_lock:
             if email in verification_codes:
                 code_data = verification_codes[email]
-                code_ts = code_data.get("timestamp", 0)
-                
-                # ✅ لو allow_old=True اقبل أي كود (حتى القديم)
-                # ✅ لو allow_old=False اقبل بس الكود بعد wait_start_time
-                if allow_old or code_ts >= wait_start_time:
+                if code_data.get("timestamp", 0) >= wait_start_time:
                     code = code_data["code"]
                     del verification_codes[email]
-                    logger.info(f"✅ تم الحصول على الكود: {code} (allow_old={allow_old})")
+                    logger.info(f"✅ تم الحصول على الكود: {code}")
                     return code
                 else:
-                    logger.info(f"⏭️ تخطي كود قديم (allow_old=False)")
                     del verification_codes[email]
         
         elapsed = time.time() - start_time
@@ -1019,12 +960,45 @@ def wait_for_code(email, password, timeout=180, expected_amount=None, allow_old=
     
     logger.warning(f"⏰ انتهى وقت الانتظار لـ {email}")
     return None
+
+
+def wait_for_code_registration(email, password, timeout=180):
+    """انتظر كود التحقق — للتحقق من الحساب (بيقبل الكود الجديد اللي هييجي)"""
+    if email not in mail_monitors or not mail_monitors[email].get("running", False):
+        token = start_mail_monitor(email, password, skip_existing=True)
+        if not token:
+            return None
     
-# ============================================================
-# API اللعبة
-# ============================================================
+    start_time = time.time()
+    retry_attempts = 0
+    last_retry = 0
+    
+    while time.time() - start_time < timeout:
+        with mail_lock:
+            if email in verification_codes:
+                code_data = verification_codes[email]
+                code = code_data["code"]
+                del verification_codes[email]
+                logger.info(f"✅ تم الحصول على كود التحقق: {code}")
+                return code
+        
+        elapsed = time.time() - start_time
+        if elapsed > 60 and elapsed - last_retry > 60 and retry_attempts < 3:
+            logger.info(f"🔄 إعادة فحص البريد لـ {email}")
+            with mail_lock:
+                if email in mail_monitors:
+                    success, new_token = ensure_mail_account(email, password)
+                    if success:
+                        mail_monitors[email]["token"] = new_token
+            retry_attempts += 1
+            last_retry = elapsed
+        
+        time.sleep(3)
+    
+    logger.warning(f"⏰ انتهى وقت الانتظار لـ {email}")
+    return None
+    
 def safe_request(method, url, **kw):
-    """✅ timeout 25، محاولات 2"""
     kw.setdefault("timeout", 25)
     for attempt in range(2):
         try:
@@ -1313,9 +1287,6 @@ def farm_ads(user_id, proxy=None):
         return False
 
 
-# ============================================================
-# دوال العملات والتسلسل
-# ============================================================
 def get_coin_id_by_symbol(token, symbol="trx", proxy=None):
     cache_key = f"{token[:20]}_{symbol.lower()}"
     if cache_key in coin_id_cache:
@@ -1707,9 +1678,6 @@ def format_withdrawals(items, coin_symbol="TRX"):
     return text
 
 
-# ============================================================
-# AccountWorker
-# ============================================================
 class AccountWorker:
     def __init__(self, email, password, proxy=None, index=0, account_id=None):
         self.email = email
@@ -1887,8 +1855,7 @@ class AccountWorker:
                     success, reg_msg = do_register(self.email, self.password, self.proxy)
                     
                     if success:
-                        # ✅ allow_old=True للتحقق من الحساب
-                        code = wait_for_code(self.email, self.password, timeout=180, allow_old=True)
+                        code = wait_for_code_registration(self.email, self.password, timeout=180)
                         if code:
                             success, token, confirm_msg = do_confirm(self.email, code, self.proxy)
                             if success:
@@ -2019,7 +1986,6 @@ class AccountWorker:
             logger.error(f"❌ لا يوجد بروكسي للحساب {self.email} — السحب ملغي!")
             safe_notify(
                 f"❌ <b>السحب ملغي — لا يوجد بروكسي!</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n"
                 f"📧 {self.email}"
             )
             return False
@@ -2050,12 +2016,6 @@ class AccountWorker:
             
             logger.info(f"🔄 تنفيذ التسلسل الأولي...")
             execute_initial_sequence(self.token, self.user_id, self.proxy)
-            
-            logger.info(f"🧹 مسح الرسائل القديمة لـ {slotfruits_email}")
-            try:
-                clear_old_slotfruits_messages(slotfruits_email, password)
-            except Exception as e:
-                logger.warning(f"⚠️ فشل مسح الرسائل القديمة: {e}")
             
             success = False
             coin_id = None
@@ -2089,8 +2049,7 @@ class AccountWorker:
                 return False
             
             logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
-            # ✅ للسحب: allow_old=False (كود جديد فقط)
-            code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount, allow_old=False)
+            code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount)
             
             if not code:
                 logger.error(f"❌ انتهى وقت انتظار كود السحب")
@@ -2270,9 +2229,6 @@ class AccountWorker:
         self.running = False
         logger.info(f"⏹️ توقف الحساب {self.email}")
         
-# ============================================================
-# BotManager
-# ============================================================
 class BotManager:
     def __init__(self):
         self.workers = {}
@@ -2475,9 +2431,6 @@ class BotManager:
 bot_manager = BotManager()
 
 
-# ============================================================
-# ✅ دالة الإضافة الذكية (معدلة بـ allow_old=True للتحقق)
-# ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False,
                              forced_proxy=None, forced_proxy_index=None):
     try:
@@ -2502,7 +2455,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                     proxy_index = account_count % len(proxies)
                     proxy = proxies[proxy_index]
         
-        # ✅ فحص سريع للبروكسي
         if proxy:
             if progress_msg and not silent:
                 try:
@@ -2552,7 +2504,7 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 mail_success, mail_token = ensure_mail_account(email, password)
                 if mail_success:
                     mail_ok = True
-                    start_mail_monitor(email, password)
+                    start_mail_monitor(email, password, skip_existing=True)
                     logger.info(f"📬 البريد شغال لـ {email}")
             except Exception as e:
                 logger.error(f"خطأ في التحقق من البريد: {e}")
@@ -2614,12 +2566,12 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            clear_old_slotfruits_messages(email, password)
-            start_mail_monitor(email, password)
+            # ✅ المراقبة بتتجاهل الرسائل القديمة
+            start_mail_monitor(email, password, skip_existing=True)
             do_register(email, password, proxy)
             
-            # ✅ للتحقق: allow_old=True (اقبل الكود القديم)
-            code = wait_for_code(email, password, timeout=180, allow_old=True)
+            # ✅ دالة التحقق: تقبل الكود الجديد اللي هييجي
+            code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التحقق لـ {email}")
                 return False
@@ -2681,16 +2633,16 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            clear_old_slotfruits_messages(email, password)
-            start_mail_monitor(email, password)
+            # ✅ المراقبة بتتجاهل الرسائل القديمة
+            start_mail_monitor(email, password, skip_existing=True)
             
             success, reg_msg = do_register(email, password, proxy)
             if not success:
                 logger.error(f"❌ فشل التسجيل: {reg_msg}")
                 return False
             
-            # ✅ للتحقق: allow_old=True (اقبل الكود القديم)
-            code = wait_for_code(email, password, timeout=180, allow_old=True)
+            # ✅ دالة التحقق: تقبل الكود الجديد اللي هييجي
+            code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التسجيل لـ {email}")
                 return False
@@ -2753,9 +2705,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 pass
         return False
         
-# ============================================================
-# دوال التليجرام
-# ============================================================
 def get_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 تشغيل الكل", callback_data="start_all")],
@@ -2818,9 +2767,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(None, context, update.message.chat_id)
 
 
-# ============================================================
-# معالج الأزرار
-# ============================================================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_chat_id, bot_application
     
@@ -3031,7 +2977,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ✅ إصلاح recursive call
     elif data.startswith("del_proxy_"):
         idx = data.replace("del_proxy_", "")
         delete_map = context.user_data.get('delete_proxies', {})
@@ -3373,9 +3318,6 @@ async def show_delete_accounts(update, context):
     )
 
 
-# ============================================================
-# معالج الرسائل النصية (✅ process_account معدلة)
-# ============================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -3449,7 +3391,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account_counter = [0]
         counter_lock = threading.Lock()
         
-        # ✅ process_account معدلة: run_coroutine_threadsafe + فحص 3 بروكسيات
         def process_account(idx, email, password):
             try:
                 with counter_lock:
@@ -3460,7 +3401,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 assigned_proxy_index = 0
                 
                 if USE_PROXIES and proxies:
-                    # جرب أول 3 بروكسيات لحد ما واحد يشتغل
                     for base_proxy in proxies[:3]:
                         if SESSION_BASED_PROXY and is_session_proxy(base_proxy):
                             temp_id = int(time.time() * 1000) % 1000000 + account_number
@@ -3483,7 +3423,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             }
                         return
                 
-                # ✅ استخدم run_coroutine_threadsafe بدل asyncio.run
                 future = asyncio.run_coroutine_threadsafe(
                     add_single_account(
                         email, password, None, silent=True,
@@ -3600,9 +3539,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ أمر غير معروف. استخدم /start للبدء.")
 
 
-# ============================================================
-# أوامر إضافية
-# ============================================================
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in pending_emails:
@@ -3625,9 +3561,6 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ============================================================
-# الوظيفة الرئيسية
-# ============================================================
 def main():
     global bot_application, is_shutting_down, main_event_loop
     
@@ -3659,7 +3592,7 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
     
-    print("🎰 Starting Slot Bot - النسخة النهائية المعدلة")
+    print("🎰 Starting Slot Bot - النسخة النهائية")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print(f"💰 إيميل السحب: {FAUCETPAY_EMAIL}")
@@ -3667,14 +3600,13 @@ def main():
     print(f"🌐 وضع البروكسي: {'Session (Bright Data)' if session_mode else 'عادي'}")
     print(f"📊 عدد البروكسيات: {len(proxies)}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ wait_for_code مع allow_old")
-    print("✅ التحقق من الحساب: allow_old=True")
-    print("✅ السحب: allow_old=False")
+    print("✅ wait_for_code: للسحب (الكود الجديد فقط)")
+    print("✅ wait_for_code_registration: للتحقق (بيقبل الكود الجديد)")
+    print("✅ start_mail_monitor مع skip_existing")
+    print("✅ مفيش clear_old_slotfruits_messages")
     print("✅ فحص البروكسي إجباري قبل السحب")
     print("✅ run_coroutine_threadsafe في المتعدد")
     print("✅ timeout safe_request = 25 ثانية")
-    print("✅ فحص 3 بروكسيات في المتعدد")
-    print("✅ إصلاح recursive call في del_proxy_")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     try:
