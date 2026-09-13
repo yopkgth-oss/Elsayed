@@ -790,9 +790,9 @@ def extract_code_from_mail(email_data, expected_amount=None):
 
 
 # ============================================================
-# ✅ start_mail_monitor مع skip_existing
+# ✅ start_mail_monitor — بدون skip_existing
 # ============================================================
-def start_mail_monitor(email, password, skip_existing=True):
+def start_mail_monitor(email, password):
     with mail_lock:
         if email in mail_monitors and mail_monitors[email].get("running", False):
             return mail_monitors[email].get("token")
@@ -804,19 +804,6 @@ def start_mail_monitor(email, password, skip_existing=True):
         
         if email not in seen_messages:
             seen_messages[email] = set()
-        
-        # ✅ سجل الرسائل الموجودة حالياً (عشان نتجاهلها)
-        if skip_existing:
-            try:
-                existing = get_mail_messages(token, limit=30)
-                if existing:
-                    for msg in existing:
-                        msg_id = msg.get("id")
-                        if msg_id:
-                            seen_messages[email].add(msg_id)
-                    logger.info(f"📬 تم تسجيل {len(existing)} رسالة موجودة (لتجاهلها)")
-            except Exception as e:
-                logger.error(f"خطأ في تسجيل الرسائل الموجودة: {e}")
         
         mail_monitors[email] = {
             "token": token,
@@ -917,7 +904,7 @@ def start_mail_monitor(email, password, skip_existing=True):
 def wait_for_code(email, password, timeout=180, expected_amount=None):
     """انتظر كود التحقق — للسحب فقط (الكود الجديد)"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
-        token = start_mail_monitor(email, password, skip_existing=True)
+        token = start_mail_monitor(email, password)
         if not token:
             return None
     
@@ -963,12 +950,17 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
 
 
 def wait_for_code_registration(email, password, timeout=180):
-    """انتظر كود التحقق — للتحقق من الحساب (بيقبل الكود الجديد اللي هييجي)"""
+    """انتظر كود التحقق — للتحقق من الحساب (بيقبل الكود الجديد بس اللي هييجي)"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
-        token = start_mail_monitor(email, password, skip_existing=True)
+        token = start_mail_monitor(email, password)
         if not token:
             return None
     
+    with mail_lock:
+        if email in verification_codes:
+            del verification_codes[email]
+    
+    wait_start_time = time.time()
     start_time = time.time()
     retry_attempts = 0
     last_retry = 0
@@ -977,10 +969,13 @@ def wait_for_code_registration(email, password, timeout=180):
         with mail_lock:
             if email in verification_codes:
                 code_data = verification_codes[email]
-                code = code_data["code"]
-                del verification_codes[email]
-                logger.info(f"✅ تم الحصول على كود التحقق: {code}")
-                return code
+                if code_data.get("timestamp", 0) >= wait_start_time:
+                    code = code_data["code"]
+                    del verification_codes[email]
+                    logger.info(f"✅ تم الحصول على كود التحقق: {code}")
+                    return code
+                else:
+                    del verification_codes[email]
         
         elapsed = time.time() - start_time
         if elapsed > 60 and elapsed - last_retry > 60 and retry_attempts < 3:
@@ -2504,7 +2499,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 mail_success, mail_token = ensure_mail_account(email, password)
                 if mail_success:
                     mail_ok = True
-                    start_mail_monitor(email, password, skip_existing=True)
+                    # ✅ بدون skip_existing
+                    start_mail_monitor(email, password)
                     logger.info(f"📬 البريد شغال لـ {email}")
             except Exception as e:
                 logger.error(f"خطأ في التحقق من البريد: {e}")
@@ -2566,11 +2562,11 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            # ✅ المراقبة بتتجاهل الرسائل القديمة
-            start_mail_monitor(email, password, skip_existing=True)
+            # ✅ بدون skip_existing
+            start_mail_monitor(email, password)
             do_register(email, password, proxy)
             
-            # ✅ دالة التحقق: تقبل الكود الجديد اللي هييجي
+            # ✅ دالة التحقق: بتقبل الكود الجديد بس
             code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التحقق لـ {email}")
@@ -2633,15 +2629,15 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            # ✅ المراقبة بتتجاهل الرسائل القديمة
-            start_mail_monitor(email, password, skip_existing=True)
+            # ✅ بدون skip_existing
+            start_mail_monitor(email, password)
             
             success, reg_msg = do_register(email, password, proxy)
             if not success:
                 logger.error(f"❌ فشل التسجيل: {reg_msg}")
                 return False
             
-            # ✅ دالة التحقق: تقبل الكود الجديد اللي هييجي
+            # ✅ دالة التحقق: بتقبل الكود الجديد بس
             code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التسجيل لـ {email}")
