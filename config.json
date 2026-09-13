@@ -7,7 +7,8 @@
   "min_withdraw": 1000,
   "min_target": 55000,
   "max_target": 65000,
-  "use_proxies": true,
+  "use_proxies": false,
   "database_file": "accounts.db",
-  "items_per_page": 25
+  "items_per_page": 25,
+  "withdraw_email": "amemo0536@gmail.com"
 }
