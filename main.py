@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Slot Bot - النسخة النهائية الكاملة
+Slot Bot - النسخة النهائية الكاملة (معدلة)
 مع كل التعديلات:
 - get_trx_coin_id (ديناميكي)
 - execute_initial_sequence
@@ -13,6 +13,11 @@ Slot Bot - النسخة النهائية الكاملة
 - إيميل FaucetPay موحد للسحب
 - السحب اليدوي لا يوقف الحساب
 - عرض حالات السحب من API (اكتشاف تلقائي)
+- ✅ فحص البروكسي إجباري قبل السحب
+- ✅ عرض IP الحقيقي في الرسائل
+- ✅ إلغاء السحب لو البروكسي مش شغال
+- ✅ إصلاح asyncio.run في الحسابات المتعددة
+- ✅ تقليل timeout safe_request
 """
 
 import os
@@ -56,7 +61,7 @@ def load_config():
         "base_url": "https://slotfruits.com",
         "mail_tm_api": "https://api.mail.tm",
         "mail_tm_domain": "@uberip.com",
-        "timeout": 60,
+        "timeout": 90,
         "min_withdraw": 1000,
         "min_target": 55000,
         "max_target": 65000,
@@ -99,7 +104,7 @@ if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
 BASE_URL = CONFIG.get("base_url")
 MAIL_TM_API = CONFIG.get("mail_tm_api")
 MAIL_TM_DOMAIN = CONFIG.get("mail_tm_domain")
-TIMEOUT = CONFIG.get("timeout", 60)
+TIMEOUT = CONFIG.get("timeout", 90)
 MIN_WITHDRAW = CONFIG.get("min_withdraw", 1000)
 MIN_TARGET = CONFIG.get("min_target", 55000)
 MAX_TARGET = CONFIG.get("max_target", 65000)
@@ -110,7 +115,6 @@ DATABASE_FILE = CONFIG.get("database_file", "accounts.db")
 ITEMS_PER_PAGE = CONFIG.get("items_per_page", 25)
 WITHDRAW_COIN = CONFIG.get("withdraw_coin", "trx").lower()
 
-# ✅ إيميل FaucetPay الموحد للسحب
 FAUCETPAY_EMAIL = CONFIG.get("faucetpay_email", "").strip()
 
 API_URL = f"{BASE_URL}/api/v1"
@@ -377,8 +381,7 @@ def add_spin(account_id, spin_number, reward, balance, credits):
         return True
     except:
         return False
-
-
+        
 # ============================================================
 # نظام البروكسيات
 # ============================================================
@@ -455,7 +458,7 @@ def build_session_proxy(account_id, base_proxy, session_prefix="acc"):
         return base_proxy
 
 
-def get_ip(proxy, timeout=10):
+def get_ip(proxy, timeout=30):
     if not proxy:
         return "بدون بروكسي"
     
@@ -502,7 +505,7 @@ def get_cached_ip(proxy, force_refresh=False):
             if (time.time() - cached_time) < max_age:
                 return cached_ip
     
-    ip = get_ip(proxy, timeout=10)
+    ip = get_ip(proxy, timeout=30)
     with ip_cache_lock:
         ip_cache[proxy] = (time.time(), ip)
     return ip
@@ -520,7 +523,7 @@ def test_proxy_detailed(proxy):
         response = requests.get(
             "https://api.ipify.org?format=json",
             proxies={"http": proxy_clean, "https": proxy_clean},
-            timeout=20
+            timeout=30
         )
         response_time = time.time() - start_time
         
@@ -635,12 +638,31 @@ def create_mail_account(email=None, password=None):
         res = requests.post(url, json={"address": email, "password": password}, timeout=15)
         if res.status_code == 201:
             return email, password, True
+        logger.error(f"❌ Mail.tm رفض: {res.status_code} — {res.text[:200]}")
         return email, password, False
-    except:
+    except Exception as e:
+        logger.error(f"❌ Mail.tm اتصال فشل: {e}")
         return email, password, False
 
 
 def ensure_mail_account(email, password):
+    logger.info(f"🔍 فحص البريد: {email}")
+    
+    # فحص الدومين
+    try:
+        domains_res = requests.get(f"{MAIL_TM_API}/domains", timeout=15)
+        if domains_res.status_code == 200:
+            domains = domains_res.json().get("hydra:member", [])
+            active = [d["domain"] for d in domains if d.get("isActive")]
+            
+            email_domain = email.split("@")[-1]
+            if email_domain not in active:
+                logger.error(f"❌ الدومين '{email_domain}' مش متاح! المتاح: {active[:5]}")
+                return False, None
+    except Exception as e:
+        logger.error(f"❌ فشل جلب الدومينات: {e}")
+        return False, None
+    
     token = get_mail_token(email, password)
     if token:
         logger.info(f"✅ البريد {email} موجود")
@@ -993,20 +1015,21 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
     
     logger.warning(f"⏰ انتهى وقت الانتظار لـ {email}")
     return None
-
-
+    
 # ============================================================
 # API اللعبة
 # ============================================================
 def safe_request(method, url, **kw):
-    kw.setdefault("timeout", TIMEOUT)
-    for attempt in range(3):
+    """✅ معدلة: timeout 25 بدل 90، محاولات 2 بدل 3"""
+    kw.setdefault("timeout", 25)
+    for attempt in range(2):
         try:
             response = requests.request(method, url, **kw)
             if response.status_code < 500:
                 return response
             time.sleep(1)
-        except:
+        except Exception as e:
+            logger.warning(f"⚠️ محاولة {attempt+1}/2 فشلت: {str(e)[:80]}")
             time.sleep(0.5)
     return None
 
@@ -1085,7 +1108,9 @@ def do_login(email, password, proxy=None):
 
 
 def check_account_exists_in_slotfruits(email, password, proxy=None):
+    """✅ معدلة: رسائل خطأ واضحة"""
     try:
+        logger.info(f"🔍 فحص {email}")
         url = f"{API_URL}/users/signupFaucetPayLogin"
         payload = {"email": email, "password": password}
         headers = {
@@ -1104,7 +1129,8 @@ def check_account_exists_in_slotfruits(email, password, proxy=None):
         res = safe_request("POST", url, **kw)
         
         if not res:
-            return {"exists": False, "error": "لا يوجد استجابة من السيرفر"}
+            logger.error(f"❌ البروكسي مش شغال لـ {email}")
+            return {"exists": False, "error": "البروكسي مش شغال"}
         
         try:
             data = res.json()
@@ -1544,7 +1570,7 @@ def confirm_withdrawal(token, address, amount, code, coin_id=None, proxy=None):
 
 
 # ============================================================
-# ✅ دوال عرض حالات السحب من API
+# دوال عرض حالات السحب من API
 # ============================================================
 def find_withdrawals_endpoint(token, proxy=None):
     """يجرب كل المسارات الممكنة ويطلع اللي شغال"""
@@ -1577,7 +1603,6 @@ def find_withdrawals_endpoint(token, proxy=None):
     
     results = []
     
-    # نجرب REST API
     for url in rest_endpoints:
         try:
             res = safe_request("GET", url, **kw_base)
@@ -1604,7 +1629,6 @@ def find_withdrawals_endpoint(token, proxy=None):
         except:
             pass
     
-    # نجرب GraphQL
     gql_queries = [
         ("getWithdraws", "query { getWithdraws { _id value status createAt address hash } }"),
         ("getWithdraw", "query { getWithdraw { _id value status createAt address hash } }"),
@@ -1732,6 +1756,10 @@ class AccountWorker:
         self.setup_proxy()
     
     def setup_proxy(self):
+        if not USE_PROXIES:
+            logger.warning(f"⚠️ الحساب {self.email}: USE_PROXIES = False في config!")
+            return
+        
         if not self.raw_proxy and USE_PROXIES:
             proxies = load_proxies()
             if not proxies:
@@ -1761,6 +1789,9 @@ class AccountWorker:
                 "http": self.proxy,
                 "https": self.proxy
             }
+            logger.info(f"🌐 بروكسي الحساب {self.email}: {self.proxy[:60]}...")
+        else:
+            logger.error(f"❌ الحساب {self.email}: لا يوجد بروكسي!")
     
     def change_proxy(self):
         if not USE_PROXIES:
@@ -1797,17 +1828,25 @@ class AccountWorker:
         
         if not self.proxy:
             self.current_ip = "بدون بروكسي"
+            logger.warning(f"⚠️ الحساب {self.email}: بدون بروكسي!")
             return
         
-        self.current_ip = get_ip(self.proxy, timeout=15)
+        logger.info(f"🌐 جاري اختبار البروكسي للحساب {self.email}...")
+        self.current_ip = get_ip(self.proxy, timeout=30)
         
         retry = 0
-        while self.current_ip == "Unknown" and retry < 3 and self.running:
-            logger.warning(f"⚠️ البروكسي لا يستجيب، إعادة محاولة...")
-            time.sleep(5)
+        while self.current_ip == "Unknown" and retry < 5:
+            logger.warning(f"⚠️ البروكسي مش شغال، محاولة {retry+1}/5...")
+            time.sleep(3)
             if self.change_proxy():
-                self.current_ip = get_ip(self.proxy, timeout=15)
+                self.current_ip = get_ip(self.proxy, timeout=30)
             retry += 1
+        
+        if self.current_ip == "Unknown":
+            logger.error(f"❌ فشل جلب IP للحساب {self.email}")
+            self.current_ip = "فشل البروكسي"
+        else:
+            logger.info(f"✅ IP للحساب {self.email}: {self.current_ip}")
     
     def login(self):
         if not self.email or not self.password:
@@ -1961,12 +2000,13 @@ class AccountWorker:
         
         target = self.account.get('target_amount', MIN_TARGET)
         if self.balance >= target:
-            return self.withdraw()
+            result = self.withdraw(is_manual=False)
+            return bool(result)
         
         return False
     
     def withdraw(self, is_manual=False):
-        """السحب التلقائي/اليدوي - مع التحقق من الرصيد + إيميل FaucetPay موحد"""
+        """السحب - مع فحص البروكسي الإجباري"""
         if self.balance < MIN_WITHDRAW:
             logger.warning(f"⚠️ الرصيد {self.balance} أقل من الحد الأدنى {MIN_WITHDRAW}")
             return False
@@ -1978,12 +2018,39 @@ class AccountWorker:
         amount = int(self.balance)
         mode = "يدوي" if is_manual else "تلقائي"
         
+        if not self.proxy:
+            logger.error(f"❌ لا يوجد بروكسي للحساب {self.email} — السحب ملغي!")
+            safe_notify(
+                f"❌ <b>السحب ملغي — لا يوجد بروكسي!</b>\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"📧 {self.email}\n"
+                f"⚠️ الحساب بدون بروكسي"
+            )
+            return False
+        
+        logger.info(f"🔍 فحص البروكسي قبل السحب...")
+        real_ip = get_ip(self.proxy, timeout=30)
+        
+        if real_ip == "Unknown":
+            logger.error(f"❌ البروكسي مش شغال — السحب ملغي!")
+            safe_notify(
+                f"❌ <b>السحب ملغي — البروكسي مش شغال!</b>\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"📧 {self.email}\n"
+                f"🌐 <code>{self.proxy[:60]}...</code>\n"
+                f"⚠️ راجع البروكسي"
+            )
+            return False
+        
+        self.current_ip = real_ip
+        logger.info(f"✅ البروكسي شغال: {real_ip}")
+        
         try:
             faucetpay_email = FAUCETPAY_EMAIL if FAUCETPAY_EMAIL else self.email
             slotfruits_email = self.email
             password = self.password
             
-            logger.info(f"💰 سحب {mode}: {amount} من {slotfruits_email} → {faucetpay_email}")
+            logger.info(f"💰 سحب {mode}: {amount} من {slotfruits_email} → {faucetpay_email} | IP: {real_ip}")
             
             if not self.coin_id:
                 self.coin_id = get_coin_id_by_symbol(self.token, WITHDRAW_COIN, self.proxy)
@@ -1997,7 +2064,6 @@ class AccountWorker:
             except Exception as e:
                 logger.warning(f"⚠️ فشل مسح الرسائل القديمة: {e}")
             
-            # نطلب كود السحب
             success = False
             coin_id = None
             message = ""
@@ -2029,7 +2095,6 @@ class AccountWorker:
                     add_withdrawal(self.account_id, amount, faucetpay_email, "FP", "failed")
                 return False
             
-            # ننتظر الكود
             logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
             code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount)
             
@@ -2041,7 +2106,6 @@ class AccountWorker:
             
             logger.info(f"✅ تم استلام الكود: {code}")
             
-            # نأكد السحب
             success, result, error = confirm_withdrawal(
                 self.token, faucetpay_email, amount, code,
                 coin_id=coin_id,
@@ -2060,11 +2124,11 @@ class AccountWorker:
                     f"📧 {self.email}\n"
                     f"💸 إلى: {faucetpay_email}\n"
                     f"💰 المبلغ: {amount:,.0f}\n"
+                    f"🌐 IP: {real_ip}\n"
                     f"⚠️ <b>السبب:</b> {error}"
                 )
                 return False
             
-            # نتحقق من الرصيد
             logger.info(f"🔍 التحقق من الرصيد بعد السحب...")
             time.sleep(3)
             
@@ -2094,6 +2158,7 @@ class AccountWorker:
                     f"📧 {self.email}\n"
                     f"💰 المطلوب: {amount:,.0f}\n"
                     f"💰 الحالي: {verified_balance:,.0f}\n"
+                    f"🌐 IP: {real_ip}\n"
                     f"⚠️ <b>السحب لم يتم</b>"
                 )
                 return False
@@ -2101,14 +2166,12 @@ class AccountWorker:
             actual_amount = balance_before - verified_balance
             logger.info(f"✅ السحب اتم! الرصيد: {verified_balance}")
             
-            # ✅ حفظ النتيجة (مختلف بين يدوي وتلقائي)
             if self.account_id:
                 add_withdrawal(self.account_id, actual_amount, faucetpay_email, "FP", "completed")
                 
                 today = datetime.now().strftime("%Y-%m-%d")
                 
                 if is_manual:
-                    # ✅ سحب يدوي: لا نوقف الحساب
                     update_account(
                         self.account_id,
                         balance=verified_balance,
@@ -2117,7 +2180,6 @@ class AccountWorker:
                     )
                     logger.info(f"✅ سحب يدوي - الحساب مستمر")
                 else:
-                    # سحب تلقائي: نوقف لحد الغد
                     update_account(
                         self.account_id,
                         balance=verified_balance,
@@ -2133,11 +2195,12 @@ class AccountWorker:
             safe_notify(
                 f"💰 <b>تم السحب بنجاح ({mode})!</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n"
-                f"📧 {self.email}\n"
+                f"📧 الحساب: {self.email}\n"
                 f"💸 إلى: {faucetpay_email}\n"
                 f"💰 المبلغ: {actual_amount:,.0f}\n"
                 f"💰 الرصيد الجديد: {verified_balance:,.0f}\n"
-                f"🌐 IP: {self.current_ip}\n"
+                f"🌐 IP: {real_ip}\n"
+                f"✅ تم التحويل\n"
                 f"{'▶️ الحساب مستمر' if is_manual else '⏸️ الحساب موقوف لليوم'}"
             )
             
@@ -2153,17 +2216,16 @@ class AccountWorker:
             return False
     
     def run(self):
+        self.running = True
+        
         self.init_network()
         
         if not self.login():
             self.running = False
             return
         
-        self.running = True
-        
         while self.running and not is_shutting_down:
             try:
-                # ✅ فحص قبل السحب التلقائي
                 self.account = get_account_by_id(self.account_id)
                 has_withdrawn = self.account.get('has_withdrawn_today', 0) if self.account else 0
                 
@@ -2218,8 +2280,7 @@ class AccountWorker:
         
         self.running = False
         logger.info(f"⏹️ توقف الحساب {self.email}")
-
-
+        
 # ============================================================
 # BotManager
 # ============================================================
@@ -2426,7 +2487,7 @@ bot_manager = BotManager()
 
 
 # ============================================================
-# دالة الإضافة الذكية
+# دالة الإضافة الذكية (✅ معدلة - فحص بروكسي + timeout)
 # ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False,
                              forced_proxy=None, forced_proxy_index=None):
@@ -2452,7 +2513,36 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                     proxy_index = account_count % len(proxies)
                     proxy = proxies[proxy_index]
         
-        if progress_msg:
+        # ✅ فحص سريع للبروكسي
+        if proxy:
+            if progress_msg and not silent:
+                try:
+                    await progress_msg.edit_text(
+                        f"🔍 <b>فحص البروكسي...</b>\n📧 {email}",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            real_ip = get_ip(proxy, timeout=12)
+            
+            if real_ip == "Unknown":
+                logger.error(f"❌ البروكسي مش شغال لـ {email}")
+                if progress_msg and not silent:
+                    try:
+                        await progress_msg.edit_text(
+                            f"❌ <b>البروكسي مش شغال!</b>\n"
+                            f"📧 {email}\n"
+                            f"🌐 <code>{str(proxy)[:50]}...</code>",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+                return False
+            
+            logger.info(f"✅ البروكسي شغال: {real_ip}")
+        
+        if progress_msg and not silent:
             try:
                 await progress_msg.edit_text(
                     f"🔍 <b>التحقق من الحساب...</b>\n📧 {email}",
@@ -2666,8 +2756,7 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             except:
                 pass
         return False
-
-
+        
 # ============================================================
 # دوال التليجرام
 # ============================================================
@@ -2946,6 +3035,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
+    # ✅ معدلة: بدل recursive call
     elif data.startswith("del_proxy_"):
         idx = data.replace("del_proxy_", "")
         delete_map = context.user_data.get('delete_proxies', {})
@@ -2957,13 +3047,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 proxies.remove(proxy)
                 save_proxies(proxies)
                 await query.edit_message_text(f"✅ تم حذف البروكسي")
-            else:
-                await query.edit_message_text("❌ لم يتم العثور عليه")
-        else:
-            await query.edit_message_text("❌ بروكسي غير صالح")
         
         await asyncio.sleep(1)
-        await button_handler(update, context)
+        
+        # اعرض القائمة مباشرة بدون recursive
+        proxies = load_proxies()
+        if not proxies:
+            await query.edit_message_text("📭 لا يوجد بروكسيات!")
+            return
+        
+        keyboard = []
+        for i, p in enumerate(proxies[:20]):
+            display = p[:40] + "..." if len(p) > 40 else p
+            keyboard.append([InlineKeyboardButton(f"🗑️ {display}", callback_data=f"del_proxy_{i}")])
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="proxies_menu")])
+        
+        context.user_data['delete_proxies'] = {str(i): p for i, p in enumerate(proxies[:20])}
+        
+        await query.edit_message_text(
+            "🗑️ <b>اختر البروكسي للحذف:</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
     
     elif data == "manual_withdraw":
         accounts = get_all_accounts()
@@ -2998,7 +3103,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ✅ السحب اليدوي - لا يوقف الحساب
     elif data.startswith("wd_now_"):
         account_id = int(data.split("_")[2])
         account = get_account_by_id(account_id)
@@ -3015,7 +3119,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ البريد غير متاح لهذا الحساب")
             return
         
-        # ✅ نحفظ حالة الـ worker الأصلي
         original_worker = bot_manager.workers.get(account_id)
         was_running = original_worker is not None and original_worker.running
         
@@ -3024,17 +3127,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time.sleep(1)
         
         await query.edit_message_text(
-            f"🔄 <b>جاري السحب اليدوي...</b>\n"
-            f"💸 إلى: {FAUCETPAY_EMAIL}\n"
-            f"▶️ الحساب سيفضل شغال بعد السحب",
+            f"🔄 <b>جاري تحضير السحب اليدوي...</b>\n"
+            f"💸 إلى: {FAUCETPAY_EMAIL}",
             parse_mode="HTML"
         )
         
-        # نستخدم worker مؤقت
         proxies = load_proxies()
         proxy = account.get('proxy')
         if proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0]):
             proxy = build_session_proxy(account_id, proxies[0], SESSION_PREFIX)
+        
+        if not proxy:
+            await query.edit_message_text(
+                f"❌ <b>لا يوجد بروكسي للحساب!</b>\n"
+                f"📧 {account['email']}\n"
+                f"⚠️ أضف بروكسي في proxy.txt",
+                parse_mode="HTML"
+            )
+            if was_running and original_worker and account_id in bot_manager.workers:
+                original_worker.running = True
+            return
         
         temp_worker = AccountWorker(
             email=account['email'],
@@ -3050,9 +3162,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_worker.account = account
         temp_worker.mail_ok = True
         
+        await query.edit_message_text(
+            f"🔄 <b>جاري اختبار البروكسي...</b>\n"
+            f"💸 إلى: {FAUCETPAY_EMAIL}",
+            parse_mode="HTML"
+        )
+        
+        temp_worker.running = True
+        temp_worker.current_ip = get_ip(temp_worker.proxy, timeout=30)
+        
+        if temp_worker.current_ip == "Unknown":
+            await query.edit_message_text(
+                f"❌ <b>البروكسي مش شغال!</b>\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"📧 {account['email']}\n"
+                f"🌐 <code>{temp_worker.proxy[:60]}...</code>\n\n"
+                f"⚠️ <b>السحب ملغي</b>\n"
+                f"▶️ الحساب مستمر",
+                parse_mode="HTML"
+            )
+            if was_running and original_worker and account_id in bot_manager.workers:
+                original_worker.running = True
+                original_worker.stopped = False
+            await asyncio.sleep(2)
+            await show_main_menu(update, context, query.message.chat_id)
+            return
+        
+        await query.edit_message_text(
+            f"✅ <b>البروكسي شغال</b>\n"
+            f"🌐 IP: <code>{temp_worker.current_ip}</code>\n"
+            f"💸 جاري السحب إلى: {FAUCETPAY_EMAIL}...",
+            parse_mode="HTML"
+        )
+        
         temp_worker.coin_id = get_coin_id_by_symbol(temp_worker.token, WITHDRAW_COIN, temp_worker.proxy)
         
-        # ✅ سحب يدوي
         success = temp_worker.withdraw(is_manual=True)
         
         updated_account = get_account_by_id(account_id)
@@ -3065,6 +3209,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💸 إلى: {FAUCETPAY_EMAIL}\n"
                 f"💰 الرصيد الجديد: {new_balance:,.0f}\n"
                 f"📊 عدد السحوبات: {updated_account.get('withdrawal_count', 0) if updated_account else 0}\n"
+                f"🌐 IP: <code>{temp_worker.current_ip}</code>\n"
                 f"▶️ الحساب مستمر في العمل",
                 parse_mode="HTML"
             )
@@ -3074,15 +3219,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"━━━━━━━━━━━━━━━━━\n"
                 f"💸 إلى: {FAUCETPAY_EMAIL}\n"
                 f"💰 الرصيد الحالي: {new_balance:,.0f}\n"
+                f"🌐 IP: <code>{temp_worker.current_ip}</code>\n"
                 f"▶️ الحساب مستمر في العمل",
                 parse_mode="HTML"
             )
         
-        # ✅ نرجع الـ worker الأصلي
         if was_running and original_worker and account_id in bot_manager.workers:
             original_worker.running = True
             original_worker.stopped = False
             original_worker.balance = new_balance
+            original_worker.current_ip = temp_worker.current_ip
             logger.info(f"▶️ الحساب {account['email']} استأنف العمل")
         
         await asyncio.sleep(2)
@@ -3108,7 +3254,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ✅ عرض حالات السحب من API
     elif data.startswith("wd_status_"):
         account_id = int(data.split("_")[2])
         account = get_account_by_id(account_id)
@@ -3142,7 +3287,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━\n"
         )
         
-        # نجرب نجيب من API
         api_results = []
         if token:
             api_results = find_withdrawals_endpoint(token, proxy)
@@ -3310,6 +3454,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account_counter = [0]
         counter_lock = threading.Lock()
         
+        # ✅ معدلة: فحص بروكسي + run_coroutine_threadsafe
         def process_account(idx, email, password):
             try:
                 with counter_lock:
@@ -3320,21 +3465,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 assigned_proxy_index = 0
                 
                 if USE_PROXIES and proxies:
-                    base_proxy = proxies[0]
-                    if SESSION_BASED_PROXY and is_session_proxy(base_proxy):
-                        temp_id = int(time.time() * 1000) % 1000000 + account_number
-                        assigned_proxy = build_session_proxy(temp_id, base_proxy, SESSION_PREFIX)
-                    else:
-                        assigned_proxy_index = account_number % len(proxies)
-                        assigned_proxy = proxies[assigned_proxy_index]
+                    # جرب أول 3 بروكسيات لحد ما واحد يشتغل
+                    for base_proxy in proxies[:3]:
+                        if SESSION_BASED_PROXY and is_session_proxy(base_proxy):
+                            temp_id = int(time.time() * 1000) % 1000000 + account_number
+                            test_proxy = build_session_proxy(temp_id, base_proxy, SESSION_PREFIX)
+                        else:
+                            test_proxy = base_proxy
+                        
+                        test_ip = get_ip(test_proxy, timeout=10)
+                        if test_ip != "Unknown":
+                            assigned_proxy = test_proxy
+                            logger.info(f"✅ بروكسي شغال لـ {email}: {test_ip}")
+                            break
+                    
+                    if not assigned_proxy:
+                        with results_lock:
+                            results[idx] = {
+                                "email": email,
+                                "success": False,
+                                "error": "لا يوجد بروكسي شغال"
+                            }
+                        return
                 
-                success = asyncio.run(
+                # ✅ استخدم run_coroutine_threadsafe بدل asyncio.run
+                future = asyncio.run_coroutine_threadsafe(
                     add_single_account(
                         email, password, None, silent=True,
                         forced_proxy=assigned_proxy,
                         forced_proxy_index=assigned_proxy_index
-                    )
+                    ),
+                    main_event_loop
                 )
+                success = future.result(timeout=300)
                 
                 with results_lock:
                     results[idx] = {
@@ -3501,7 +3664,7 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
     
-    print("🎰 Starting Slot Bot - النسخة النهائية")
+    print("🎰 Starting Slot Bot - النسخة النهائية المعدلة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print(f"💰 إيميل السحب: {FAUCETPAY_EMAIL}")
@@ -3509,15 +3672,13 @@ def main():
     print(f"🌐 وضع البروكسي: {'Session (Bright Data)' if session_mode else 'عادي'}")
     print(f"📊 عدد البروكسيات: {len(proxies)}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ get_coin_id (ديناميكي): مفعل")
-    print("✅ execute_initial_sequence: مفعل")
-    print("✅ مراقبة البريد: مفعل")
-    print("✅ مسح الرسائل القديمة: مفعل")
-    print("✅ التحقق من الرصيد بعد السحب: مفعل")
-    print("✅ Session Proxy: مفعل")
-    print("✅ إيميل FaucetPay موحد: مفعل")
-    print("✅ السحب اليدوي لا يوقف الحساب: مفعل")
-    print("✅ عرض حالات السحب من API: مفعل")
+    print("✅ فحص البروكسي إجباري قبل السحب")
+    print("✅ فحص البروكسي قبل الفحص")
+    print("✅ timeout safe_request = 25 ثانية")
+    print("✅ asyncio.run_coroutine_threadsafe (بدل asyncio.run)")
+    print("✅ جرب 3 بروكسيات في المتعدد")
+    print("✅ إصلاح recursive call في del_proxy_")
+    print("✅ check_target ترجع bool صريحة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     try:
