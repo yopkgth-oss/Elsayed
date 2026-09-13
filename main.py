@@ -3,20 +3,10 @@
 
 """
 Slot Bot - النسخة النهائية الكاملة (معدلة)
-مع كل التعديلات:
-- get_trx_coin_id (ديناميكي)
-- execute_initial_sequence
-- فلترة FaucetPay + المبلغ
-- مسح الرسائل القديمة
-- التحقق من الرصيد بعد السحب
-- Bright Data Session Proxy (IP مختلف لكل حساب)
-- إيميل FaucetPay موحد للسحب
-- السحب اليدوي لا يوقف الحساب
-- عرض حالات السحب من API (اكتشاف تلقائي)
-- ✅ فحص البروكسي إجباري قبل السحب
-- ✅ عرض IP الحقيقي في الرسائل
-- ✅ إلغاء السحب لو البروكسي مش شغال
-- ✅ إصلاح asyncio.run في الحسابات المتعددة
+التعديلات الجديدة:
+- ✅ allow_old في wait_for_code (للتحقق من الحساب)
+- ✅ فحص بروكسي إجباري قبل السحب
+- ✅ إصلاح asyncio في المتعدد
 - ✅ تقليل timeout safe_request
 """
 
@@ -648,7 +638,6 @@ def create_mail_account(email=None, password=None):
 def ensure_mail_account(email, password):
     logger.info(f"🔍 فحص البريد: {email}")
     
-    # فحص الدومين
     try:
         domains_res = requests.get(f"{MAIL_TM_API}/domains", timeout=15)
         if domains_res.status_code == 200:
@@ -970,7 +959,16 @@ def start_mail_monitor(email, password):
     return token
 
 
-def wait_for_code(email, password, timeout=180, expected_amount=None):
+# ============================================================
+# ✅ الدالة المعدلة: wait_for_code مع allow_old
+# ============================================================
+def wait_for_code(email, password, timeout=180, expected_amount=None, allow_old=False):
+    """
+    انتظر كود التحقق من البريد
+    
+    allow_old=True  → اقبل الكود القديم (للتحقق من الحساب)
+    allow_old=False → اقبل الكود الجديد فقط (للسحب)
+    """
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
         token = start_mail_monitor(email, password)
         if not token:
@@ -980,7 +978,8 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
         if email in mail_monitors:
             mail_monitors[email]["expected_amount"] = expected_amount
         
-        if email in verification_codes:
+        # لو allow_old=False، امسح الأكواد القديمة
+        if not allow_old and email in verification_codes:
             del verification_codes[email]
     
     wait_start_time = time.time()
@@ -992,12 +991,17 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
         with mail_lock:
             if email in verification_codes:
                 code_data = verification_codes[email]
-                if code_data.get("timestamp", 0) >= wait_start_time:
+                code_ts = code_data.get("timestamp", 0)
+                
+                # ✅ لو allow_old=True اقبل أي كود (حتى القديم)
+                # ✅ لو allow_old=False اقبل بس الكود بعد wait_start_time
+                if allow_old or code_ts >= wait_start_time:
                     code = code_data["code"]
                     del verification_codes[email]
-                    logger.info(f"✅ تم الحصول على الكود: {code}")
+                    logger.info(f"✅ تم الحصول على الكود: {code} (allow_old={allow_old})")
                     return code
                 else:
+                    logger.info(f"⏭️ تخطي كود قديم (allow_old=False)")
                     del verification_codes[email]
         
         elapsed = time.time() - start_time
@@ -1020,7 +1024,7 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
 # API اللعبة
 # ============================================================
 def safe_request(method, url, **kw):
-    """✅ معدلة: timeout 25 بدل 90، محاولات 2 بدل 3"""
+    """✅ timeout 25، محاولات 2"""
     kw.setdefault("timeout", 25)
     for attempt in range(2):
         try:
@@ -1108,7 +1112,6 @@ def do_login(email, password, proxy=None):
 
 
 def check_account_exists_in_slotfruits(email, password, proxy=None):
-    """✅ معدلة: رسائل خطأ واضحة"""
     try:
         logger.info(f"🔍 فحص {email}")
         url = f"{API_URL}/users/signupFaucetPayLogin"
@@ -1569,12 +1572,7 @@ def confirm_withdrawal(token, address, amount, code, coin_id=None, proxy=None):
         return False, None, str(e)
 
 
-# ============================================================
-# دوال عرض حالات السحب من API
-# ============================================================
 def find_withdrawals_endpoint(token, proxy=None):
-    """يجرب كل المسارات الممكنة ويطلع اللي شغال"""
-    
     rest_endpoints = [
         f"{API_URL}/users/withdrawals",
         f"{API_URL}/users/withdraws",
@@ -1667,7 +1665,6 @@ def find_withdrawals_endpoint(token, proxy=None):
 
 
 def format_withdrawals(items, coin_symbol="TRX"):
-    """تنسيق عرض السحوبات"""
     if not items:
         return "📭 لا توجد سحوبات\n"
     
@@ -1890,7 +1887,8 @@ class AccountWorker:
                     success, reg_msg = do_register(self.email, self.password, self.proxy)
                     
                     if success:
-                        code = wait_for_code(self.email, self.password, timeout=180)
+                        # ✅ allow_old=True للتحقق من الحساب
+                        code = wait_for_code(self.email, self.password, timeout=180, allow_old=True)
                         if code:
                             success, token, confirm_msg = do_confirm(self.email, code, self.proxy)
                             if success:
@@ -2006,7 +2004,6 @@ class AccountWorker:
         return False
     
     def withdraw(self, is_manual=False):
-        """السحب - مع فحص البروكسي الإجباري"""
         if self.balance < MIN_WITHDRAW:
             logger.warning(f"⚠️ الرصيد {self.balance} أقل من الحد الأدنى {MIN_WITHDRAW}")
             return False
@@ -2023,8 +2020,7 @@ class AccountWorker:
             safe_notify(
                 f"❌ <b>السحب ملغي — لا يوجد بروكسي!</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n"
-                f"📧 {self.email}\n"
-                f"⚠️ الحساب بدون بروكسي"
+                f"📧 {self.email}"
             )
             return False
         
@@ -2035,10 +2031,7 @@ class AccountWorker:
             logger.error(f"❌ البروكسي مش شغال — السحب ملغي!")
             safe_notify(
                 f"❌ <b>السحب ملغي — البروكسي مش شغال!</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"📧 {self.email}\n"
-                f"🌐 <code>{self.proxy[:60]}...</code>\n"
-                f"⚠️ راجع البروكسي"
+                f"📧 {self.email}"
             )
             return False
         
@@ -2096,7 +2089,8 @@ class AccountWorker:
                 return False
             
             logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
-            code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount)
+            # ✅ للسحب: allow_old=False (كود جديد فقط)
+            code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount, allow_old=False)
             
             if not code:
                 logger.error(f"❌ انتهى وقت انتظار كود السحب")
@@ -2120,11 +2114,8 @@ class AccountWorker:
                 
                 safe_notify(
                     f"❌ <b>فشل السحب ({mode})</b>\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
                     f"📧 {self.email}\n"
-                    f"💸 إلى: {faucetpay_email}\n"
                     f"💰 المبلغ: {amount:,.0f}\n"
-                    f"🌐 IP: {real_ip}\n"
                     f"⚠️ <b>السبب:</b> {error}"
                 )
                 return False
@@ -2157,9 +2148,7 @@ class AccountWorker:
                     f"❌ <b>فشل السحب ({mode})</b>\n"
                     f"📧 {self.email}\n"
                     f"💰 المطلوب: {amount:,.0f}\n"
-                    f"💰 الحالي: {verified_balance:,.0f}\n"
-                    f"🌐 IP: {real_ip}\n"
-                    f"⚠️ <b>السحب لم يتم</b>"
+                    f"💰 الحالي: {verified_balance:,.0f}"
                 )
                 return False
             
@@ -2487,7 +2476,7 @@ bot_manager = BotManager()
 
 
 # ============================================================
-# دالة الإضافة الذكية (✅ معدلة - فحص بروكسي + timeout)
+# ✅ دالة الإضافة الذكية (معدلة بـ allow_old=True للتحقق)
 # ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False,
                              forced_proxy=None, forced_proxy_index=None):
@@ -2629,12 +2618,15 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             start_mail_monitor(email, password)
             do_register(email, password, proxy)
             
-            code = wait_for_code(email, password, timeout=180)
+            # ✅ للتحقق: allow_old=True (اقبل الكود القديم)
+            code = wait_for_code(email, password, timeout=180, allow_old=True)
             if not code:
+                logger.error(f"❌ فشل استلام كود التحقق لـ {email}")
                 return False
             
             success, token, confirm_msg = do_confirm(email, code, proxy)
             if not success:
+                logger.error(f"❌ فشل تأكيد الحساب: {confirm_msg}")
                 return False
             
             user_info = get_user_info(token, proxy)
@@ -2694,14 +2686,18 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             
             success, reg_msg = do_register(email, password, proxy)
             if not success:
+                logger.error(f"❌ فشل التسجيل: {reg_msg}")
                 return False
             
-            code = wait_for_code(email, password, timeout=180)
+            # ✅ للتحقق: allow_old=True (اقبل الكود القديم)
+            code = wait_for_code(email, password, timeout=180, allow_old=True)
             if not code:
+                logger.error(f"❌ فشل استلام كود التسجيل لـ {email}")
                 return False
             
             success, token, confirm_msg = do_confirm(email, code, proxy)
             if not success:
+                logger.error(f"❌ فشل تأكيد الحساب الجديد: {confirm_msg}")
                 return False
             
             user_info = get_user_info(token, proxy)
@@ -3035,7 +3031,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ✅ معدلة: بدل recursive call
+    # ✅ إصلاح recursive call
     elif data.startswith("del_proxy_"):
         idx = data.replace("del_proxy_", "")
         delete_map = context.user_data.get('delete_proxies', {})
@@ -3050,7 +3046,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await asyncio.sleep(1)
         
-        # اعرض القائمة مباشرة بدون recursive
         proxies = load_proxies()
         if not proxies:
             await query.edit_message_text("📭 لا يوجد بروكسيات!")
@@ -3379,7 +3374,7 @@ async def show_delete_accounts(update, context):
 
 
 # ============================================================
-# معالج الرسائل النصية
+# معالج الرسائل النصية (✅ process_account معدلة)
 # ============================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -3454,7 +3449,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account_counter = [0]
         counter_lock = threading.Lock()
         
-        # ✅ معدلة: فحص بروكسي + run_coroutine_threadsafe
+        # ✅ process_account معدلة: run_coroutine_threadsafe + فحص 3 بروكسيات
         def process_account(idx, email, password):
             try:
                 with counter_lock:
@@ -3672,13 +3667,14 @@ def main():
     print(f"🌐 وضع البروكسي: {'Session (Bright Data)' if session_mode else 'عادي'}")
     print(f"📊 عدد البروكسيات: {len(proxies)}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("✅ wait_for_code مع allow_old")
+    print("✅ التحقق من الحساب: allow_old=True")
+    print("✅ السحب: allow_old=False")
     print("✅ فحص البروكسي إجباري قبل السحب")
-    print("✅ فحص البروكسي قبل الفحص")
+    print("✅ run_coroutine_threadsafe في المتعدد")
     print("✅ timeout safe_request = 25 ثانية")
-    print("✅ asyncio.run_coroutine_threadsafe (بدل asyncio.run)")
-    print("✅ جرب 3 بروكسيات في المتعدد")
+    print("✅ فحص 3 بروكسيات في المتعدد")
     print("✅ إصلاح recursive call في del_proxy_")
-    print("✅ check_target ترجع bool صريحة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     try:
