@@ -3,10 +3,10 @@
 
 """
 Slot Bot - النسخة النهائية
-- wait_for_code: للسحب (الكود الجديد فقط)
+- wait_for_code: للسحب (زي الأصل - متغيرش)
 - wait_for_code_registration: للتحقق (بيقبل الكود القديم)
-- start_mail_monitor مع skip_existing (يتجاهل الرسائل القديمة)
-- مفيش clear_old_slotfruits_messages
+- extract_code_filtered: دالة جديدة للتحقق
+- monitor_loop: بيخزن في مكانين
 """
 
 import os
@@ -561,7 +561,8 @@ def get_working_proxy(current_proxy=None):
 # ============================================================
 mail_monitors = {}
 seen_messages = {}
-verification_codes = {}
+verification_codes = {}      # للسحب (زي الأصل)
+registration_codes = {}      # ✅ جديد — للتسجيل
 
 
 def safe_str(value):
@@ -685,6 +686,9 @@ def get_mail_message(token, message_id):
         return None
 
 
+# ============================================================
+# ✅ extract_code_from_mail — للسحب (زي الأصل — متغيرش)
+# ============================================================
 def extract_code_from_mail(email_data, expected_amount=None):
     if not email_data:
         return None
@@ -790,7 +794,101 @@ def extract_code_from_mail(email_data, expected_amount=None):
 
 
 # ============================================================
-# ✅ start_mail_monitor — بدون skip_existing
+# ✅ extract_code_filtered — جديد (للتسجيل بس)
+# ============================================================
+def extract_code_filtered(email_data):
+    """
+    استخرج كود التحقق — للتسجيل بس
+    بيرجع tuple: (code, msg_type) أو (None, None)
+    """
+    if not email_data:
+        return None, None
+    
+    sender = ""
+    from_data = email_data.get("from", {})
+    if isinstance(from_data, dict):
+        sender = from_data.get("address", "")
+    sender = safe_str(sender).lower()
+    
+    subject = safe_str(email_data.get("subject", ""))
+    subject_lower = subject.lower()
+    
+    body_text = safe_str(email_data.get("text", ""))
+    body_html = safe_str(email_data.get("html", ""))
+    
+    if body_text.strip():
+        full_text = body_text
+    else:
+        full_text = clean_html(body_html)
+    
+    # تجاهل FaucetPay
+    if "faucetpay" in sender or "faucetpay" in subject_lower:
+        logger.info(f"⏭️ تجاهل: FaucetPay ({subject[:40]})")
+        return None, "faucetpay"
+    
+    # صنّف الرسالة
+    is_verification = (
+        "email verification" in subject_lower or
+        "verify your email" in subject_lower or
+        "confirm your email" in subject_lower or
+        "verification code" in subject_lower or
+        "email confirm" in subject_lower
+    )
+    
+    is_withdrawal = (
+        "withdrawal" in subject_lower or
+        "confirm your withdrawal" in subject_lower
+    )
+    
+    is_2fa = (
+        "2fa" in subject_lower or
+        "authorization" in subject_lower or
+        "two factor" in subject_lower
+    )
+    
+    is_login = (
+        "login notification" in subject_lower or
+        "new login" in subject_lower or
+        "sign-in" in subject_lower
+    )
+    
+    if is_2fa:
+        logger.info(f"⏭️ تجاهل: 2FA ({subject[:40]})")
+        return None, "2fa"
+    
+    if is_login:
+        logger.info(f"⏭️ تجاهل: Login ({subject[:40]})")
+        return None, "login"
+    
+    if not (is_verification or is_withdrawal):
+        logger.info(f"⏭️ تجاهل: نوع غير معروف ({subject[:40]})")
+        return None, "unknown"
+    
+    msg_type = "verification" if is_verification else "withdrawal"
+    
+    # استخرج الكود
+    patterns = [
+        r"verification\s+code\s*[:\-]\s*([0-9]{4,10})",
+        r"code\s*[:\-]\s*([0-9]{4,10})",
+        r"رمز\s+التحقق\s*[:\-]\s*([0-9]{4,10})",
+        r"كود\s+التأكيد\s*[:\-]\s*([0-9]{4,10})",
+        r"\b([0-9]{6})\b",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, full_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            code = match.group(1)
+            if code in FAKE_NUMBERS:
+                continue
+            if 4 <= len(code) <= 10 and code.isdigit():
+                return code, msg_type
+    
+    return None, None
+
+
+# ============================================================
+# ✅ start_mail_monitor — بيخزن في مكانين
 # ============================================================
 def start_mail_monitor(email, password):
     with mail_lock:
@@ -861,16 +959,32 @@ def start_mail_monitor(email, password):
                         
                         detail = get_mail_message(token, msg_id)
                         if detail:
-                            code = extract_code_from_mail(detail, expected_amount)
-                            if code:
+                            # ✅ 1. تخزين للسحب (زي الأصل)
+                            code_withdrawal = extract_code_from_mail(detail, expected_amount)
+                            if code_withdrawal:
                                 with mail_lock:
                                     verification_codes[email] = {
-                                        "code": code,
+                                        "code": code_withdrawal,
                                         "timestamp": time.time(),
                                         "subject": subject,
                                         "expected_amount": expected_amount
                                     }
-                                logger.info(f"✅ تم استلام كود لـ {email}: {code}")
+                                logger.info(f"✅ كود سحب مخزن: {code_withdrawal}")
+                            
+                            # ✅ 2. تخزين للتسجيل (جديد)
+                            code_reg, msg_type = extract_code_filtered(detail)
+                            if code_reg and msg_type == "verification":
+                                with mail_lock:
+                                    if email not in registration_codes:
+                                        registration_codes[email] = []
+                                    
+                                    registration_codes[email].append({
+                                        "code": code_reg,
+                                        "type": msg_type,
+                                        "subject": subject[:60],
+                                        "timestamp": time.time(),
+                                    })
+                                logger.info(f"✅ كود تحقق مخزن: {code_reg}")
                 
                 time.sleep(3)
                 
@@ -898,9 +1012,8 @@ def start_mail_monitor(email, password):
 
 
 # ============================================================
-# ✅ دالتين منفصلتين: للسحب (wait_for_code) وللتحقق (wait_for_code_registration)
+# ✅ wait_for_code — للسحب (زي الأصل — متغيرش)
 # ============================================================
-
 def wait_for_code(email, password, timeout=180, expected_amount=None):
     """انتظر كود التحقق — للسحب فقط (الكود الجديد)"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
@@ -949,33 +1062,29 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
     return None
 
 
+# ============================================================
+# ✅ wait_for_code_registration — جديد (للتسجيل)
+# ============================================================
 def wait_for_code_registration(email, password, timeout=180):
-    """انتظر كود التحقق — للتحقق من الحساب (بيقبل الكود الجديد بس اللي هييجي)"""
+    """انتظر كود التحقق — للتسجيل (بيقبل الكود القديم — من registration_codes)"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
         token = start_mail_monitor(email, password)
         if not token:
             return None
     
-    with mail_lock:
-        if email in verification_codes:
-            del verification_codes[email]
-    
-    wait_start_time = time.time()
     start_time = time.time()
     retry_attempts = 0
     last_retry = 0
     
     while time.time() - start_time < timeout:
         with mail_lock:
-            if email in verification_codes:
-                code_data = verification_codes[email]
-                if code_data.get("timestamp", 0) >= wait_start_time:
-                    code = code_data["code"]
-                    del verification_codes[email]
-                    logger.info(f"✅ تم الحصول على كود التحقق: {code}")
-                    return code
-                else:
-                    del verification_codes[email]
+            if email in registration_codes and registration_codes[email]:
+                for i, code_data in enumerate(registration_codes[email]):
+                    if code_data.get("type") == "verification":
+                        code = code_data["code"]
+                        registration_codes[email].pop(i)
+                        logger.info(f"✅ تم الحصول على كود التحقق: {code}")
+                        return code
         
         elapsed = time.time() - start_time
         if elapsed > 60 and elapsed - last_retry > 60 and retry_attempts < 3:
@@ -1850,6 +1959,7 @@ class AccountWorker:
                     success, reg_msg = do_register(self.email, self.password, self.proxy)
                     
                     if success:
+                        # ✅ دالة التحقق: بتقبل أي كود تحقق (حتى القديم)
                         code = wait_for_code_registration(self.email, self.password, timeout=180)
                         if code:
                             success, token, confirm_msg = do_confirm(self.email, code, self.proxy)
@@ -2044,6 +2154,7 @@ class AccountWorker:
                 return False
             
             logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
+            # ✅ للسحب: الكود الجديد بس (زي الأصل)
             code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount)
             
             if not code:
@@ -2499,7 +2610,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 mail_success, mail_token = ensure_mail_account(email, password)
                 if mail_success:
                     mail_ok = True
-                    # ✅ بدون skip_existing
                     start_mail_monitor(email, password)
                     logger.info(f"📬 البريد شغال لـ {email}")
             except Exception as e:
@@ -2562,11 +2672,10 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            # ✅ بدون skip_existing
             start_mail_monitor(email, password)
             do_register(email, password, proxy)
             
-            # ✅ دالة التحقق: بتقبل الكود الجديد بس
+            # ✅ دالة التحقق: بتقبل الكود القديم (من registration_codes)
             code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التحقق لـ {email}")
@@ -2629,7 +2738,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             if not mail_ok:
                 return False
             
-            # ✅ بدون skip_existing
             start_mail_monitor(email, password)
             
             success, reg_msg = do_register(email, password, proxy)
@@ -2637,7 +2745,7 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 logger.error(f"❌ فشل التسجيل: {reg_msg}")
                 return False
             
-            # ✅ دالة التحقق: بتقبل الكود الجديد بس
+            # ✅ دالة التحقق: بتقبل الكود القديم (من registration_codes)
             code = wait_for_code_registration(email, password, timeout=180)
             if not code:
                 logger.error(f"❌ فشل استلام كود التسجيل لـ {email}")
@@ -3588,7 +3696,7 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
     
-    print("🎰 Starting Slot Bot - النسخة النهائية")
+    print("🎰 Starting Slot Bot - النسخة النهائية المعدلة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print(f"💰 إيميل السحب: {FAUCETPAY_EMAIL}")
@@ -3596,10 +3704,10 @@ def main():
     print(f"🌐 وضع البروكسي: {'Session (Bright Data)' if session_mode else 'عادي'}")
     print(f"📊 عدد البروكسيات: {len(proxies)}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ wait_for_code: للسحب (الكود الجديد فقط)")
-    print("✅ wait_for_code_registration: للتحقق (بيقبل الكود الجديد)")
-    print("✅ start_mail_monitor مع skip_existing")
-    print("✅ مفيش clear_old_slotfruits_messages")
+    print("✅ wait_for_code: للسحب (زي الأصل)")
+    print("✅ wait_for_code_registration: للتحقق (بيقبل الكود القديم)")
+    print("✅ extract_code_filtered: للتسجيل (بيفلتر 2FA)")
+    print("✅ monitor_loop: بيخزن في مكانين")
     print("✅ فحص البروكسي إجباري قبل السحب")
     print("✅ run_coroutine_threadsafe في المتعدد")
     print("✅ timeout safe_request = 25 ثانية")
