@@ -12,12 +12,10 @@ Slot Bot - النسخة النهائية الكاملة
 - Bright Data Session Proxy (IP مختلف لكل حساب)
 - إيميل FaucetPay موحد للسحب
 - السحب اليدوي لا يوقف الحساب
+- عرض حالات السحب من API (اكتشاف تلقائي)
 - ✅ فحص البروكسي إجباري قبل السحب
 - ✅ عرض IP الحقيقي في الرسائل
 - ✅ إلغاء السحب لو البروكسي مش شغال
-- ✅ اكتشاف تلقائي لـ endpoint السحوبات (51 احتمال)
-- ✅ عرض حالات السحب الكاملة (معلق/مدفوع/مرفوض)
-- ✅ حفظ الـ endpoint المكتشف في الداتابيز
 """
 
 import os
@@ -142,19 +140,10 @@ mail_lock = threading.Lock()
 worker_lock = threading.Lock()
 proxy_lock = threading.Lock()
 ip_cache_lock = threading.Lock()
-api_discovery_lock = threading.Lock()
 
 ip_cache = {}
 proxy_failures = {}
 coin_id_cache = {}
-
-# كاش للـ endpoint المكتشف
-discovered_endpoint = {
-    "type": None,  # "rest" أو "graphql"
-    "url": None,
-    "name": None,
-    "timestamp": 0
-}
 
 # ============================================================
 # إشعار آمن من أي thread
@@ -237,62 +226,9 @@ def init_database():
         )
     """)
     
-    # ✅ جدول جديد لتخزين endpoint السحوبات المكتشف
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS api_endpoints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            endpoint_type TEXT NOT NULL,
-            url TEXT NOT NULL,
-            name TEXT,
-            discovered_at TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1
-        )
-    """)
-    
     conn.commit()
     conn.close()
     logger.info("✅ تم تهيئة قاعدة البيانات")
-
-
-def save_discovered_endpoint(endpoint_type, url, name):
-    """حفظ الـ endpoint المكتشف في الداتابيز"""
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE api_endpoints SET is_active = 0")
-        cursor.execute("""
-            INSERT INTO api_endpoints (endpoint_type, url, name, discovered_at, is_active)
-            VALUES (?, ?, ?, ?, 1)
-        """, (endpoint_type, url, name, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"خطأ في حفظ endpoint: {e}")
-        return False
-
-
-def get_saved_endpoint():
-    """جلب الـ endpoint المحفوظ"""
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT endpoint_type, url, name FROM api_endpoints 
-            WHERE is_active = 1 ORDER BY discovered_at DESC LIMIT 1
-        """)
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return {
-                "type": row[0],
-                "url": row[1],
-                "name": row[2]
-            }
-        return None
-    except:
-        return None
 
 
 def _row_to_account(row):
@@ -1610,15 +1546,23 @@ def confirm_withdrawal(token, address, amount, code, coin_id=None, proxy=None):
 
 
 # ============================================================
-# ✅ اكتشاف endpoint السحوبات (51 احتمال)
+# دوال عرض حالات السحب من API
 # ============================================================
-def discover_withdrawals_endpoint(token, proxy=None):
-    """
-    يجرب 51 احتمال (39 REST + 12 GraphQL)
-    ويرجع أي واحد شغال عنده بيانات
-    """
-    print(f"🔍 بدء اكتشاف endpoint السحوبات...")
-    logger.info(f"🔍 بدء اكتشاف endpoint السحوبات...")
+def find_withdrawals_endpoint(token, proxy=None):
+    """يجرب كل المسارات الممكنة ويطلع اللي شغال"""
+    
+    rest_endpoints = [
+        f"{API_URL}/users/withdrawals",
+        f"{API_URL}/users/withdraws",
+        f"{API_URL}/users/withdraw",
+        f"{API_URL}/users/history",
+        f"{API_URL}/users/historic",
+        f"{API_URL}/users/transactions",
+        f"{API_URL}/users/payments",
+        f"{API_URL}/withdrawals",
+        f"{API_URL}/withdraws",
+        f"{API_URL}/transactions",
+    ]
     
     headers = {
         "User-Agent": "okhttp/4.12.0",
@@ -1626,237 +1570,80 @@ def discover_withdrawals_endpoint(token, proxy=None):
         "Authorization": f"Bearer {token}"
     }
     
-    kw_base = {"headers": headers, "timeout": 10}
+    kw_base = {"headers": headers, "timeout": 15}
     if proxy:
         proxy_clean = proxy.strip()
         if not proxy_clean.startswith("http://"):
             proxy_clean = f"http://{proxy_clean}"
         kw_base["proxies"] = {"http": proxy_clean, "https": proxy_clean}
     
-    found = []
+    results = []
     
-    # ============ REST endpoints ============
-    rest_endpoints = [
-        '/api/v1/users/withdrawals',
-        '/api/v1/users/withdraws',
-        '/api/v1/users/withdraw',
-        '/api/v1/users/history',
-        '/api/v1/users/historic',
-        '/api/v1/users/transactions',
-        '/api/v1/users/payments',
-        '/api/v1/users/wallet',
-        '/api/v1/users/walletHistory',
-        '/api/v1/users/withdrawHistory',
-        '/api/v1/users/withdraw_history',
-        '/api/v1/users/paymentHistory',
-        '/api/v1/users/withdrawals/history',
-        '/api/v1/users/me/withdrawals',
-        '/api/v1/users/me/withdraws',
-        '/api/v1/users/me/history',
-        '/api/v1/users/me/transactions',
-        '/api/v1/user/withdrawals',
-        '/api/v1/user/history',
-        '/api/v1/withdrawals',
-        '/api/v1/withdraws',
-        '/api/v1/transactions',
-        '/api/v1/history',
-        '/api/v1/wallet/history',
-        '/api/v1/wallet/withdrawals',
-        '/api/v2/users/withdrawals',
-        '/api/v2/users/history',
-        '/api/v2/withdrawals',
-        '/api/users/withdrawals',
-        '/api/users/history',
-        '/user/withdrawals',
-        '/user/history',
-        '/users/withdrawals',
-        '/withdrawals',
-    ]
-    
-    for path in rest_endpoints:
-        url = f"{BASE_URL}{path}"
+    for url in rest_endpoints:
         try:
-            r = requests.get(url, headers=headers, timeout=8, 
-                           proxies=kw_base.get("proxies"))
-            if r.status_code == 200:
-                text = r.text
-                if text and text not in ["{}", "[]", "null"] and len(text) > 10:
-                    try:
-                        data = r.json()
-                        # نشوف لو فيه بيانات فعلية
-                        has_data = False
-                        for key in ["withdrawals", "withdraws", "data", "history", 
-                                    "items", "results", "docs", "list"]:
-                            if key in data:
-                                items = data[key]
-                                if isinstance(items, dict):
-                                    items = items.get("docs") or items.get("items") or []
-                                if items and len(items) > 0:
-                                    has_data = True
-                                    break
-                        
-                        if has_data or (isinstance(data, list) and len(data) > 0):
-                            found.append({
-                                "type": "rest",
-                                "url": url,
-                                "name": path,
-                                "response": text[:200]
-                            })
-                            logger.info(f"✅ REST: {path}")
-                    except:
-                        pass
+            res = safe_request("GET", url, **kw_base)
+            if res and res.status_code == 200:
+                try:
+                    data = res.json()
+                    for key in ["withdrawals", "withdraws", "data", "history", 
+                                "items", "results", "docs", "list"]:
+                        if key in data:
+                            items = data[key]
+                            if isinstance(items, dict):
+                                items = items.get("docs") or items.get("items") or []
+                            if items and len(items) > 0:
+                                results.append({
+                                    "url": url,
+                                    "kind": "REST",
+                                    "items": items,
+                                    "count": len(items)
+                                })
+                                logger.info(f"✅ REST شغال: {url} → {len(items)}")
+                                break
+                except:
+                    pass
         except:
             pass
     
-    # ============ GraphQL endpoints ============
+    gql_queries = [
+        ("getWithdraws", "query { getWithdraws { _id value status createAt address hash } }"),
+        ("getWithdraw", "query { getWithdraw { _id value status createAt address hash } }"),
+        ("getUserWithdraws", "query { getUserWithdraws { _id value status createAt address hash } }"),
+        ("getHistoricWithdraws", "query { getHistoricWithdraws { _id value status createAt address hash } }"),
+        ("getTransactions", "query { getTransactions { _id value status createAt address hash } }"),
+    ]
+    
     gql_headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "okhttp/4.12.0"
     }
-    
-    gql_kw = {"headers": gql_headers, "timeout": 10}
+    gql_kw = {"headers": gql_headers, "timeout": 15}
     if proxy:
         gql_kw["proxies"] = kw_base.get("proxies", {})
     
-    gql_queries = [
-        ('getWithdraws', 'query { getWithdraws { _id value status createAt address hash } }'),
-        ('getWithdraw', 'query { getWithdraw { _id value status createAt address hash } }'),
-        ('getUserWithdraws', 'query { getUserWithdraws { _id value status createAt } }'),
-        ('getWithdrawHistory', 'query { getWithdrawHistory { _id value status createAt } }'),
-        ('getHistoric', 'query { getHistoric { _id value status createAt } }'),
-        ('getHistoricWithdraws', 'query { getHistoricWithdraws { _id value status createAt } }'),
-        ('getTransactions', 'query { getTransactions { _id value status createAt } }'),
-        ('withdraws', 'query { withdraws { _id value status createAt } }'),
-        ('withdrawHistory', 'query { withdrawHistory { _id value status createAt } }'),
-        ('transactions', 'query { transactions { _id value status createAt } }'),
-        ('historic', 'query { historic { _id value status createAt } }'),
-        ('walletHistory', 'query { walletHistory { _id value status createAt } }'),
-    ]
-    
     for name, query in gql_queries:
         try:
-            r = requests.post(
-                GRAPHQL_URL,
-                headers=gql_headers,
-                json={"query": query},
-                timeout=10,
-                proxies=gql_kw.get("proxies")
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("data"):
-                    for k, v in data["data"].items():
-                        if v and v != [] and v != {}:
-                            found.append({
-                                "type": "graphql",
-                                "url": GRAPHQL_URL,
-                                "name": name,
-                                "response": json.dumps(data, ensure_ascii=False)[:200]
-                            })
-                            logger.info(f"✅ GraphQL: {name}")
-                            break
+            res = safe_request("POST", GRAPHQL_URL, json={"query": query}, **gql_kw)
+            if res and res.status_code == 200:
+                data = res.json()
+                items = data.get("data", {}).get(name)
+                if items and isinstance(items, list) and len(items) > 0:
+                    results.append({
+                        "url": f"GraphQL: {name}",
+                        "kind": "GraphQL",
+                        "items": items,
+                        "count": len(items)
+                    })
+                    logger.info(f"✅ GraphQL شغال: {name} → {len(items)}")
         except:
             pass
     
-    logger.info(f"📊 لقينا {len(found)} endpoint شغال")
-    return found
+    return results
 
 
-def get_withdrawals_from_api(token, proxy=None, limit=20):
-    """
-    يجيب السحوبات من الـ endpoint المحفوظ
-    لو مفيش محفوظ، يستخدم endpoint الافتراضي
-    """
-    saved = get_saved_endpoint()
-    
-    if not saved:
-        # مفيش endpoint محفوظ
-        return None, "لم يتم اكتشاف endpoint بعد — استخدم زر 🔍 اكتشاف API"
-    
-    endpoint_type = saved["type"]
-    url = saved["url"]
-    name = saved["name"]
-    
-    headers = {
-        "User-Agent": "okhttp/4.12.0",
-        "Accept": "application/json, text/plain, */*",
-        "Authorization": f"Bearer {token}"
-    }
-    
-    kw = {"headers": headers, "timeout": 15}
-    if proxy:
-        proxy_clean = proxy.strip()
-        if not proxy_clean.startswith("http://"):
-            proxy_clean = f"http://{proxy_clean}"
-        kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-    
-    try:
-        if endpoint_type == "rest":
-            r = requests.get(url, **kw)
-            if r.status_code == 200:
-                data = r.json()
-                # نستخرج القائمة
-                items = None
-                for key in ["withdrawals", "withdraws", "data", "history", 
-                            "items", "results", "docs", "list"]:
-                    if key in data:
-                        items = data[key]
-                        if isinstance(items, dict):
-                            items = items.get("docs") or items.get("items") or []
-                        break
-                
-                if items is None and isinstance(data, list):
-                    items = data
-                
-                return items or [], f"REST ({name})"
-            else:
-                return None, f"فشل API: {r.status_code}"
-        
-        elif endpoint_type == "graphql":
-            queries = {
-                'getWithdraws': 'query { getWithdraws { _id value status createAt address hash coin { sigla } } }',
-                'getWithdraw': 'query { getWithdraw { _id value status createAt address hash } }',
-                'getUserWithdraws': 'query { getUserWithdraws { _id value status createAt } }',
-                'getWithdrawHistory': 'query { getWithdrawHistory { _id value status createAt } }',
-                'getHistoric': 'query { getHistoric { _id value status createAt } }',
-                'getHistoricWithdraws': 'query { getHistoricWithdraws { _id value status createAt } }',
-                'getTransactions': 'query { getTransactions { _id value status createAt } }',
-                'withdraws': 'query { withdraws { _id value status createAt } }',
-                'withdrawHistory': 'query { withdrawHistory { _id value status createAt } }',
-                'transactions': 'query { transactions { _id value status createAt } }',
-                'historic': 'query { historic { _id value status createAt } }',
-                'walletHistory': 'query { walletHistory { _id value status createAt } }',
-            }
-            
-            query = queries.get(name, f'query {{ {name} {{ _id value status createAt }} }}')
-            
-            gql_headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "okhttp/4.12.0"
-            }
-            gql_kw = {"headers": gql_headers, "timeout": 15}
-            if proxy:
-                gql_kw["proxies"] = kw.get("proxies", {})
-            
-            r = requests.post(url, json={"query": query}, **gql_kw)
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("data", {}).get(name, [])
-                return items or [], f"GraphQL ({name})"
-            else:
-                return None, f"فشل API: {r.status_code}"
-    
-    except Exception as e:
-        logger.error(f"خطأ في get_withdrawals_from_api: {e}")
-        return None, f"خطأ: {str(e)[:50]}"
-    
-    return None, "نوع endpoint غير معروف"
-
-
-def format_withdrawals_list(items, coin_symbol="TRX"):
-    """تنسيق قائمة السحوبات للعرض"""
+def format_withdrawals(items, coin_symbol="TRX"):
+    """تنسيق عرض السحوبات"""
     if not items:
         return "📭 لا توجد سحوبات\n"
     
@@ -2206,7 +1993,7 @@ class AccountWorker:
         amount = int(self.balance)
         mode = "يدوي" if is_manual else "تلقائي"
         
-        # فحص البروكسي — إجباري
+        # ✅ فحص البروكسي — إجباري
         if not self.proxy:
             logger.error(f"❌ لا يوجد بروكسي للحساب {self.email} — السحب ملغي!")
             safe_notify(
@@ -2217,6 +2004,7 @@ class AccountWorker:
             )
             return False
         
+        # ✅ فحص البروكسي — هل هو شغال؟
         logger.info(f"🔍 فحص البروكسي قبل السحب...")
         real_ip = get_ip(self.proxy, timeout=30)
         
@@ -2253,6 +2041,7 @@ class AccountWorker:
             except Exception as e:
                 logger.warning(f"⚠️ فشل مسح الرسائل القديمة: {e}")
             
+            # نطلب كود السحب
             success = False
             coin_id = None
             message = ""
@@ -2284,6 +2073,7 @@ class AccountWorker:
                     add_withdrawal(self.account_id, amount, faucetpay_email, "FP", "failed")
                 return False
             
+            # ننتظر الكود
             logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
             code = wait_for_code(slotfruits_email, password, timeout=180, expected_amount=amount)
             
@@ -2295,6 +2085,7 @@ class AccountWorker:
             
             logger.info(f"✅ تم استلام الكود: {code}")
             
+            # نأكد السحب
             success, result, error = confirm_withdrawal(
                 self.token, faucetpay_email, amount, code,
                 coin_id=coin_id,
@@ -2318,6 +2109,7 @@ class AccountWorker:
                 )
                 return False
             
+            # نتحقق من الرصيد
             logger.info(f"🔍 التحقق من الرصيد بعد السحب...")
             time.sleep(3)
             
@@ -2355,9 +2147,9 @@ class AccountWorker:
             actual_amount = balance_before - verified_balance
             logger.info(f"✅ السحب اتم! الرصيد: {verified_balance}")
             
-            # ✅ نسجل السحب كـ "معلق" بدل "مدفوع" (الحالة الحقيقية)
+            # ✅ حفظ النتيجة
             if self.account_id:
-                add_withdrawal(self.account_id, actual_amount, faucetpay_email, "FP", "pending")
+                add_withdrawal(self.account_id, actual_amount, faucetpay_email, "FP", "completed")
                 
                 today = datetime.now().strftime("%Y-%m-%d")
                 
@@ -2390,7 +2182,7 @@ class AccountWorker:
                 f"💰 المبلغ: {actual_amount:,.0f}\n"
                 f"💰 الرصيد الجديد: {verified_balance:,.0f}\n"
                 f"🌐 IP: {real_ip}\n"
-                f"⏳ <b>الحالة: معلق</b>\n"
+                f"✅ تم التحويل\n"
                 f"{'▶️ الحساب مستمر' if is_manual else '⏸️ الحساب موقوف لليوم'}"
             )
             
@@ -2509,6 +2301,7 @@ class BotManager:
                 else:
                     proxy_index = account_id % len(proxies)
                     proxy = proxies[proxy_index]
+                    logger.info(f"🌐 Proxy #{proxy_index} للحساب {account_id}")
             
             worker = AccountWorker(
                 email=account['email'],
@@ -2641,10 +2434,6 @@ class BotManager:
         
         fp_display = FAUCETPAY_EMAIL if FAUCETPAY_EMAIL else "غير محدد"
         
-        # نشوف لو الـ endpoint مكتشف
-        saved_endpoint = get_saved_endpoint()
-        api_status = "✅ مكتشف" if saved_endpoint else "❌ غير مكتشف"
-        
         text = (
             f"📊 <b>لوحة التحكم</b> (صفحة {page+1}/{total_pages})\n"
             f"━━━━━━━━━━━━━━━━━\n"
@@ -2654,7 +2443,6 @@ class BotManager:
             f"💸 إيميل السحب: <code>{fp_display}</code>\n"
             f"🎯 العملة: <b>{WITHDRAW_COIN.upper()}</b>\n"
             f"📬 بريد شغال: {mail_ok_count} | 📭 مش شغال: {mail_bad_count}\n"
-            f"🔍 API السحوبات: {api_status}\n"
             f"━━━━━━━━━━━━━━━━━\n"
             f"<b>تفاصيل الحسابات:</b>\n"
         )
@@ -2938,16 +2726,12 @@ def get_main_keyboard():
         [InlineKeyboardButton("🌐 إدارة البروكسيات", callback_data="proxies_menu")],
         [InlineKeyboardButton("💰 سحب يدوي", callback_data="manual_withdraw")],
         [InlineKeyboardButton("📥 حالات السحب", callback_data="withdrawal_status")],
-        [InlineKeyboardButton("🔍 اكتشاف API السحوبات", callback_data="discover_api")],
     ])
 
 
 async def show_main_menu(update, context, chat_id):
     status = bot_manager.get_status()
     fp_display = FAUCETPAY_EMAIL if FAUCETPAY_EMAIL else "غير محدد"
-    
-    saved = get_saved_endpoint()
-    api_status = "✅" if saved else "❌"
     
     main_text = (
         f"🎰 <b>Slot Bot - لوحة التحكم</b>\n"
@@ -2956,7 +2740,6 @@ async def show_main_menu(update, context, chat_id):
         f"🟢 النشطة: {status['running_accounts']}\n"
         f"💰 الرصيد الكلي: {status['total_balance']:,.0f}\n"
         f"💸 السحب إلى: <code>{fp_display}</code>\n"
-        f"🔍 API السحوبات: {api_status}\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"اختر الإجراء المناسب:"
     )
@@ -3041,7 +2824,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav_buttons:
             keyboard.append(nav_buttons)
         keyboard.append([InlineKeyboardButton("🔄 تحديث", callback_data=f"dashboard_{current_page}")])
-        keyboard.append([InlineKeyboardButton("🔍 اكتشاف API", callback_data="discover_api")])
         keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
         
         await query.edit_message_text(
@@ -3049,84 +2831,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
-    
-    # ✅ زر اكتشاف API
-    elif data == "discover_api":
-        accounts = get_all_accounts()
-        if not accounts:
-            await query.edit_message_text("❌ لا توجد حسابات — أضف حساب أولاً")
-            return
-        
-        # نستخدم أول حساب عنده توكن
-        test_account = None
-        for acc in accounts:
-            if acc.get('token'):
-                test_account = acc
-                break
-        
-        if not test_account:
-            await query.edit_message_text("❌ لا يوجد حساب عنده توكن — شغّل حساب أولاً")
-            return
-        
-        await query.edit_message_text(
-            f"🔍 <b>جاري اكتشاف endpoint السحوبات...</b>\n"
-            f"📧 الحساب: {test_account['email']}\n"
-            f"⏳ بيجرب 51 احتمال (39 REST + 12 GraphQL)\n"
-            f"⌛ ممكن ياخد 1-2 دقيقة",
-            parse_mode="HTML"
-        )
-        
-        # نشغله في thread منفصل عشان ما يوقفش البوت
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None, 
-            discover_withdrawals_endpoint,
-            test_account['token'],
-            test_account.get('proxy')
-        )
-        
-        if not results:
-            text = (
-                f"❌ <b>لم يتم العثور على endpoint شغال</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"📧 الحساب: {test_account['email']}\n\n"
-                f"<b>الأسباب المحتملة:</b>\n"
-                f"• التوكن منتهي — شغّل الحساب من البوت\n"
-                f"• الحساب ماعملش سحوبات لسه\n"
-                f"• SlotFruits بتستخدم أسماء مختلفة\n\n"
-                f"💡 <b>جرّب:</b>\n"
-                f"1. شغّل الحساب من البوت\n"
-                f"2. استنى يشتغل 1-2 دقيقة\n"
-                f"3. اضغط \"اكتشاف API\" تاني"
-            )
-            
-            keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-            return
-        
-        # ✅ لقينا endpoints — نعرضها
-        text = (
-            f"✅ <b>تم العثور على {len(results)} endpoint!</b>\n"
-            f"━━━━━━━━━━━━━━━━━\n\n"
-        )
-        
-        for i, r in enumerate(results[:5], 1):
-            text += f"<b>{i}. {r['type'].upper()}</b>\n"
-            text += f"🔗 <code>{r['name']}</code>\n"
-            text += f"📦 {r['response'][:150]}\n\n"
-        
-        # نحفظ أفضل واحد (الأول)
-        best = results[0]
-        save_discovered_endpoint(best['type'], best['url'], best['name'])
-        
-        text += (
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"💾 <b>تم حفظ:</b> <code>{best['name']}</code>\n"
-            f"✅ دلوقتي تقدر تستخدم \"📥 حالات السحب\""
-        )
-        
-        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     
     elif data == "add_account":
         pending_emails[user_id] = "waiting_for_account"
@@ -3338,6 +3042,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
+    # ✅ السحب اليدوي - لا يوقف الحساب + فحص البروكسي إجباري
     elif data.startswith("wd_now_"):
         account_id = int(data.split("_")[2])
         account = get_account_by_id(account_id)
@@ -3354,6 +3059,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ البريد غير متاح لهذا الحساب")
             return
         
+        # حفظ حالة الـ worker الأصلي
         original_worker = bot_manager.workers.get(account_id)
         was_running = original_worker is not None and original_worker.running
         
@@ -3367,11 +3073,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         
+        # نجيب بروكسي
         proxies = load_proxies()
         proxy = account.get('proxy')
         if proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0]):
             proxy = build_session_proxy(account_id, proxies[0], SESSION_PREFIX)
         
+        # ✅ فحص وجود بروكسي
         if not proxy:
             await query.edit_message_text(
                 f"❌ <b>لا يوجد بروكسي للحساب!</b>\n"
@@ -3397,6 +3105,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_worker.account = account
         temp_worker.mail_ok = True
         
+        # ✅ نجيب IP البروكسي الأول
         await query.edit_message_text(
             f"🔄 <b>جاري اختبار البروكسي...</b>\n"
             f"💸 إلى: {FAUCETPAY_EMAIL}",
@@ -3432,6 +3141,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         temp_worker.coin_id = get_coin_id_by_symbol(temp_worker.token, WITHDRAW_COIN, temp_worker.proxy)
         
+        # ✅ سحب يدوي
         success = temp_worker.withdraw(is_manual=True)
         
         updated_account = get_account_by_id(account_id)
@@ -3445,7 +3155,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 الرصيد الجديد: {new_balance:,.0f}\n"
                 f"📊 عدد السحوبات: {updated_account.get('withdrawal_count', 0) if updated_account else 0}\n"
                 f"🌐 IP: <code>{temp_worker.current_ip}</code>\n"
-                f"⏳ <b>الحالة: معلق</b>\n"
                 f"▶️ الحساب مستمر في العمل",
                 parse_mode="HTML"
             )
@@ -3460,6 +3169,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
         
+        # نرجع الـ worker الأصلي
         if was_running and original_worker and account_id in bot_manager.workers:
             original_worker.running = True
             original_worker.stopped = False
@@ -3484,14 +3194,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )])
         keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
         
-        # لو مفيش endpoint مكتشف، ننصح بالاكتشاف
-        saved = get_saved_endpoint()
-        hint = ""
-        if not saved:
-            hint = "\n\n⚠️ <b>لازم تكتشف API الأول</b>\nاضغط 🔍 اكتشاف API السحوبات"
-        
         await query.edit_message_text(
-            f"📥 <b>اختر الحساب لعرض السحوبات:</b>{hint}",
+            "📥 <b>اختر الحساب لعرض السحوبات:</b>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
@@ -3504,25 +3208,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ الحساب غير موجود")
             return
         
-        # نشوف لو الـ endpoint مكتشف
-        saved = get_saved_endpoint()
-        
-        if not saved:
-            keyboard = [
-                [InlineKeyboardButton("🔍 اكتشاف API", callback_data="discover_api")],
-                [InlineKeyboardButton("🔙 رجوع", callback_data="withdrawal_status")],
-            ]
-            await query.edit_message_text(
-                f"⚠️ <b>لم يتم اكتشاف API السحوبات بعد</b>\n\n"
-                f"اضغط الزر تحت عشان البوت يكتشفه تلقائياً.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="HTML"
-            )
-            return
-        
         await query.edit_message_text(
             f"🔄 <b>جاري جلب السحوبات من SlotFruits...</b>\n"
-            f"📡 المصدر: {saved['name']}",
+            f"⏳ ممكن ياخد 10-20 ثانية",
             parse_mode="HTML"
         )
         
@@ -3542,21 +3230,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💸 يرسل إلى: <code>{FAUCETPAY_EMAIL}</code>\n"
             f"🎯 سحب اليوم: {has_wd}\n"
             f"📅 آخر سحب: {account.get('last_withdraw_date', 'لا يوجد') or 'لا يوجد'}\n"
-            f"🔍 المصدر: <code>{saved['name']}</code>\n"
             f"━━━━━━━━━━━━━━━━━\n"
         )
         
-        # نجيب السحوبات من API
-        items, msg = get_withdrawals_from_api(token, proxy, limit=20)
+        api_results = []
+        if token:
+            api_results = find_withdrawals_endpoint(token, proxy)
         
-        if items is not None:
-            text += f"\n📡 <b>{msg}</b>\n"
-            text += f"📊 <b>عدد السحوبات:</b> {len(items)}\n"
+        if api_results:
+            best = api_results[0]
+            text += f"\n✅ <b>المصدر:</b> {best['kind']}\n"
+            text += f"🔗 <code>{best['url'][:70]}</code>\n"
+            text += f"📊 <b>عدد السحوبات:</b> {best['count']}\n"
             text += f"━━━━━━━━━━━━━━━━━\n\n"
-            text += format_withdrawals_list(items, WITHDRAW_COIN.upper())
+            text += format_withdrawals(best['items'], WITHDRAW_COIN.upper())
+            
+            if len(api_results) > 1:
+                text += f"\n💡 في {len(api_results) - 1} مصدر تاني متاح"
         else:
-            text += f"\n⚠️ <b>فشل جلب السحوبات</b>\n"
-            text += f"📝 {msg}\n\n"
+            text += "\n⚠️ <b>لم يتم العثور على API</b>\n"
             text += "بنعرض السحوبات المحلية:\n\n"
             
             local = get_withdrawals(account_id, limit=10)
@@ -3576,7 +3268,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
             [InlineKeyboardButton("🔄 تحديث", callback_data=f"wd_status_{account_id}")],
-            [InlineKeyboardButton("🔍 إعادة اكتشاف API", callback_data="discover_api")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="withdrawal_status")],
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -3858,66 +3549,12 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     if total > 1:
         keyboard.append([InlineKeyboardButton("التالي ➡️", callback_data="dashboard_1")])
-    keyboard.append([InlineKeyboardButton("🔍 اكتشاف API", callback_data="discover_api")])
     
     await update.message.reply_text(
         text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         parse_mode="HTML"
     )
-
-
-async def discover_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """أمر /discover لاكتشاف API السحوبات"""
-    bot_manager.chat_id = update.message.chat_id
-    
-    accounts = get_all_accounts()
-    if not accounts:
-        await update.message.reply_text("❌ لا توجد حسابات")
-        return
-    
-    test_account = None
-    for acc in accounts:
-        if acc.get('token'):
-            test_account = acc
-            break
-    
-    if not test_account:
-        await update.message.reply_text("❌ لا يوجد حساب عنده توكن")
-        return
-    
-    msg = await update.message.reply_text(
-        f"🔍 <b>جاري اكتشاف API السحوبات...</b>\n"
-        f"📧 {test_account['email']}\n"
-        f"⏳ ممكن ياخد 1-2 دقيقة",
-        parse_mode="HTML"
-    )
-    
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(
-        None, 
-        discover_withdrawals_endpoint,
-        test_account['token'],
-        test_account.get('proxy')
-    )
-    
-    if not results:
-        await msg.edit_text(
-            f"❌ <b>لم يتم العثور على endpoint</b>\n\n"
-            f"💡 شغّل الحساب من البوت، استنى 1-2 دقيقة، وجرب تاني",
-            parse_mode="HTML"
-        )
-        return
-    
-    text = f"✅ <b>تم العثور على {len(results)} endpoint!</b>\n\n"
-    for i, r in enumerate(results[:5], 1):
-        text += f"{i}. {r['type'].upper()}: <code>{r['name']}</code>\n"
-    
-    best = results[0]
-    save_discovered_endpoint(best['type'], best['url'], best['name'])
-    text += f"\n💾 تم حفظ: <code>{best['name']}</code>"
-    
-    await msg.edit_text(text, parse_mode="HTML")
 
 
 # ============================================================
@@ -3947,7 +3584,6 @@ def main():
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dashboard", dashboard_command))
-    application.add_handler(CommandHandler("discover", discover_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -3955,7 +3591,7 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
     
-    print("🎰 Starting Slot Bot - النسخة النهائية الكاملة")
+    print("🎰 Starting Slot Bot - النسخة النهائية")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print(f"💰 إيميل السحب: {FAUCETPAY_EMAIL}")
@@ -3971,11 +3607,10 @@ def main():
     print("✅ Session Proxy: مفعل")
     print("✅ إيميل FaucetPay موحد: مفعل")
     print("✅ السحب اليدوي لا يوقف الحساب: مفعل")
+    print("✅ عرض حالات السحب من API: مفعل")
     print("✅ فحص البروكسي إجباري قبل السحب: مفعل")
     print("✅ عرض IP الحقيقي في الرسائل: مفعل")
     print("✅ إلغاء السحب لو البروكسي مش شغال: مفعل")
-    print("✅ اكتشاف API تلقائي: مفعل")
-    print("✅ عرض حالات السحوبات الكاملة: مفعل")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     try:
