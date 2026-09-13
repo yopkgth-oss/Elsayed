@@ -1,14 +1,14 @@
 {
-  "bot_token": "8980374512:AAFQgbqG2DRmElqPV6Gu_Xy9ofNVpGZsjpY",
-  "base_url": "https://slotfruits.com",
-  "mail_tm_api": "https://api.mail.tm",
-  "mail_tm_domain": "@uberip.com",
-  "timeout": 30,
-  "min_withdraw": 1000,
-  "min_target": 55000,
-  "max_target": 65000,
-  "use_proxies": false,
-  "withdraw_email": "amemo0536@gmail.com",
-  "database_file": "accounts.db",
-  "items_per_page": 25
+  "bot_token": "8980374512:AAFQgbqG2DRmElqPV6Gu_Xy9ofNVpGZsjpY",
+  "base_url": "https://slotfruits.com",
+  "mail_tm_api": "https://api.mail.tm",
+  "mail_tm_domain": "@uberip.com",
+  "timeout": 30,
+  "min_withdraw": 1000,
+  "min_target": 55000,
+  "max_target": 65000,
+  "use_proxies": false,
+  "withdraw_email": "amemo0536@gmail.com",
+  "database_file": "accounts.db",
+  "items_per_page": 25
 }
