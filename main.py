@@ -4,11 +4,17 @@
 """
 Slot Bot - النسخة النهائية الكاملة
 مع كل التعديلات:
-- get_trx_coin_id (ديناميكي)
-- execute_initial_sequence
+- get_trx_coin_id (ديناميكي + كاش ذكي)
+- execute_initial_sequence (مرة كل 30 دقيقة)
 - فلترة FaucetPay + المبلغ
 - مسح الرسائل القديمة
 - التحقق من الرصيد بعد السحب
+- ✅ بروكسي فريد لكل حساب (Reservation System)
+- ✅ إشعارات sync (بدون asyncio loop)
+- ✅ حفظ chat_id دائم
+- ✅ معالجة 429 Rate Limit
+- ✅ فحص الهدف كل 10 spins
+- ✅ هامش مرونة في الهدف
 """
 
 import os
@@ -21,6 +27,7 @@ import sqlite3
 import threading
 import logging
 import asyncio
+import queue
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -99,15 +106,19 @@ ITEMS_PER_PAGE = CONFIG.get("items_per_page", 25)
 API_URL = f"{BASE_URL}/api/v1"
 GRAPHQL_URL = f"{BASE_URL}/graphql"
 
-# عملة السحب الافتراضية (fallback)
+# عملة السحب الافتراضية
 DEFAULT_COIN_ID = "66bd3ede56df3c77675b869d"
+
+# رقم حفظ chat_id
+CHAT_ID_FILE = "chat_id.txt"
 
 # أرقام مزيفة
 FAKE_NUMBERS = {
     "2018", "2019", "2020", "2021", "2022", "2023", 
     "2024", "2025", "2026", "2027", "2028", "2029", "2030",
     "1234", "0000", "1111", "2222", "3333", "4444", 
-    "5555", "6666", "7777", "8888", "9999"
+    "5555", "6666", "7777", "8888", "9999", "12345",
+    "54321", "121212", "123456"
 }
 
 # ============================================================
@@ -122,78 +133,146 @@ mail_lock = threading.Lock()
 worker_lock = threading.Lock()
 proxy_lock = threading.Lock()
 ip_cache_lock = threading.Lock()
+_proxy_reservation_lock = threading.Lock()
+_db_lock = threading.Lock()
 
 ip_cache = {}
 proxy_failures = {}
-coin_id_cache = {}  # ✅ كاش لكل عملة
+coin_id_cache = {}  # مفتاح: اسم العملة (مش التوكن)
+
+# ============================================================
+# دالة إشعار sync (بدون asyncio)
+# ============================================================
+def send_notification_sync(message):
+    """إرسال إشعار من أي thread بدون مشاكل event loop"""
+    global bot_chat_id
+    
+    target_chat = bot_chat_id or (bot_manager.chat_id if bot_manager else None)
+    
+    if not BOT_TOKEN or not target_chat:
+        logger.warning("⚠️ لا يمكن إرسال إشعار: BOT_TOKEN أو chat_id مفقود")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": target_chat,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ فشل إرسال إشعار: {res.status_code}")
+    except Exception as e:
+        logger.error(f"خطأ send_notification_sync: {e}")
+
+# ============================================================
+# حفظ/تحميل chat_id
+# ============================================================
+def save_chat_id(chat_id):
+    try:
+        with open(CHAT_ID_FILE, 'w') as f:
+            f.write(str(chat_id))
+        logger.info(f"💾 تم حفظ chat_id: {chat_id}")
+    except Exception as e:
+        logger.error(f"خطأ حفظ chat_id: {e}")
+
+def load_chat_id():
+    try:
+        if os.path.exists(CHAT_ID_FILE):
+            with open(CHAT_ID_FILE, 'r') as f:
+                chat_id = int(f.read().strip())
+                logger.info(f"📂 تم استرجاع chat_id: {chat_id}")
+                return chat_id
+    except Exception as e:
+        logger.error(f"خطأ تحميل chat_id: {e}")
+    return None
 
 # ============================================================
 # قاعدة البيانات
 # ============================================================
 def init_database():
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            token TEXT,
-            user_id TEXT,
-            balance REAL DEFAULT 0,
-            credits INTEGER DEFAULT 0,
-            total_earned REAL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            last_login TEXT,
-            is_active INTEGER DEFAULT 1,
-            withdrawal_count INTEGER DEFAULT 0,
-            last_withdrawal TEXT,
-            proxy TEXT,
-            spin_count INTEGER DEFAULT 0,
-            target_amount INTEGER DEFAULT 0,
-            has_withdrawn_today INTEGER DEFAULT 0,
-            last_withdraw_date TEXT,
-            proxy_index INTEGER DEFAULT 0,
-            mail_ok INTEGER DEFAULT 0,
-            account_type TEXT DEFAULT 'existing'
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            address TEXT NOT NULL,
-            wallet_type TEXT DEFAULT 'FP',
-            status TEXT DEFAULT 'pending',
-            tx_hash TEXT,
-            created_at TEXT NOT NULL,
-            completed_at TEXT
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS spin_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            spin_number INTEGER NOT NULL,
-            reward REAL DEFAULT 0,
-            balance REAL DEFAULT 0,
-            credits INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ تم تهيئة قاعدة البيانات")
-
+    with _db_lock:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                token TEXT,
+                user_id TEXT,
+                balance REAL DEFAULT 0,
+                credits INTEGER DEFAULT 0,
+                total_earned REAL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_login TEXT,
+                is_active INTEGER DEFAULT 1,
+                withdrawal_count INTEGER DEFAULT 0,
+                last_withdrawal TEXT,
+                proxy TEXT,
+                spin_count INTEGER DEFAULT 0,
+                target_amount INTEGER DEFAULT 0,
+                has_withdrawn_today INTEGER DEFAULT 0,
+                last_withdraw_date TEXT,
+                proxy_index INTEGER DEFAULT 0,
+                mail_ok INTEGER DEFAULT 0,
+                account_type TEXT DEFAULT 'existing'
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                address TEXT NOT NULL,
+                wallet_type TEXT DEFAULT 'FP',
+                status TEXT DEFAULT 'pending',
+                tx_hash TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spin_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                spin_number INTEGER NOT NULL,
+                reward REAL DEFAULT 0,
+                balance REAL DEFAULT 0,
+                credits INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        
+        # ✅ جدول حجز البروكسيات - يمنع أي تعارض
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS proxy_reservations (
+                proxy TEXT PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                reserved_at TEXT NOT NULL,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_account_proxy 
+            ON proxy_reservations(account_id)
+        """)
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ تم تهيئة قاعدة البيانات")
 
 def _row_to_account(row):
     if not row:
         return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    
     columns = ['id', 'email', 'password', 'token', 'user_id', 'balance', 'credits', 
                'total_earned', 'created_at', 'last_login', 'is_active', 'withdrawal_count',
                'last_withdrawal', 'proxy', 'spin_count', 'target_amount', 
@@ -201,148 +280,151 @@ def _row_to_account(row):
                'mail_ok', 'account_type']
     return dict(zip(columns, row))
 
-
 def get_account_by_id(account_id):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return _row_to_account(row)
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
     except Exception as e:
         logger.error(f"خطأ get_account_by_id: {e}")
         return None
 
-
 def get_account_by_email(email):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM accounts WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        conn.close()
-        return _row_to_account(row)
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM accounts WHERE email = ?", (email,))
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
     except:
         return None
 
-
 def get_all_accounts(active_only=True):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        query = "SELECT * FROM accounts"
-        if active_only:
-            query += " WHERE is_active = 1"
-        query += " ORDER BY id ASC"
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        conn.close()
-        return [_row_to_account(row) for row in rows]
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = "SELECT * FROM accounts"
+            if active_only:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY id ASC"
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
     except:
         return []
-
 
 def add_account(email, password, token=None, user_id=None, balance=0, credits=0, 
                 proxy=None, proxy_index=0, mail_ok=0, account_type='existing'):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        target = random.randint(MIN_TARGET, MAX_TARGET)
-        cursor.execute("""
-            INSERT INTO accounts (email, password, token, user_id, balance, credits, 
-                                 created_at, proxy, target_amount, proxy_index, mail_ok, account_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (email, password, token, user_id, balance, credits, datetime.now().isoformat(), 
-              proxy, target, proxy_index, mail_ok, account_type))
-        conn.commit()
-        account_id = cursor.lastrowid
-        conn.close()
-        return account_id
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            target = random.randint(MIN_TARGET, MAX_TARGET)
+            cursor.execute("""
+                INSERT INTO accounts (email, password, token, user_id, balance, credits, 
+                                     created_at, proxy, target_amount, proxy_index, mail_ok, account_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (email, password, token, user_id, balance, credits, datetime.now().isoformat(), 
+                  proxy, target, proxy_index, mail_ok, account_type))
+            conn.commit()
+            account_id = cursor.lastrowid
+            conn.close()
+            return account_id
     except Exception as e:
         logger.error(f"خطأ في إضافة حساب: {e}")
         return None
 
-
 def update_account(account_id, **kwargs):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-        values = list(kwargs.values()) + [account_id]
-        cursor.execute(f"UPDATE accounts SET {set_clause} WHERE id = ?", values)
-        conn.commit()
-        conn.close()
-        return True
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+            values = list(kwargs.values()) + [account_id]
+            cursor.execute(f"UPDATE accounts SET {set_clause} WHERE id = ?", values)
+            conn.commit()
+            conn.close()
+            return True
     except Exception as e:
         logger.error(f"خطأ في تحديث الحساب: {e}")
         return False
 
-
 def delete_account(account_id):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        cursor.execute("DELETE FROM withdrawals WHERE account_id = ?", (account_id,))
-        cursor.execute("DELETE FROM spin_history WHERE account_id = ?", (account_id,))
-        conn.commit()
-        conn.close()
-        return True
-    except:
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            cursor.execute("DELETE FROM withdrawals WHERE account_id = ?", (account_id,))
+            cursor.execute("DELETE FROM spin_history WHERE account_id = ?", (account_id,))
+            cursor.execute("DELETE FROM proxy_reservations WHERE account_id = ?", (account_id,))
+            conn.commit()
+            conn.close()
+            return True
+    except Exception as e:
+        logger.error(f"خطأ delete_account: {e}")
         return False
-
 
 def add_withdrawal(account_id, amount, address, wallet_type="FP", status="pending"):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO withdrawals (account_id, amount, address, wallet_type, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (account_id, amount, address, wallet_type, status, datetime.now().isoformat()))
-        conn.commit()
-        withdrawal_id = cursor.lastrowid
-        conn.close()
-        return withdrawal_id
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO withdrawals (account_id, amount, address, wallet_type, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (account_id, amount, address, wallet_type, status, datetime.now().isoformat()))
+            conn.commit()
+            withdrawal_id = cursor.lastrowid
+            conn.close()
+            return withdrawal_id
     except:
         return None
 
-
 def get_withdrawals(account_id, limit=10):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM withdrawals WHERE account_id = ? 
-            ORDER BY created_at DESC LIMIT ?
-        """, (account_id, limit))
-        rows = cursor.fetchall()
-        conn.close()
-        columns = ['id', 'account_id', 'amount', 'address', 'wallet_type', 'status', 
-                   'tx_hash', 'created_at', 'completed_at']
-        return [dict(zip(columns, row)) for row in rows]
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM withdrawals WHERE account_id = ? 
+                ORDER BY created_at DESC LIMIT ?
+            """, (account_id, limit))
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
     except:
         return []
 
-
 def add_spin(account_id, spin_number, reward, balance, credits):
     try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO spin_history (account_id, spin_number, reward, balance, credits, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (account_id, spin_number, reward, balance, credits, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        return True
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO spin_history (account_id, spin_number, reward, balance, credits, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (account_id, spin_number, reward, balance, credits, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            return True
     except:
         return False
 
-
 # ============================================================
-# نظام البروكسيات
+# نظام البروكسيات الأساسي
 # ============================================================
 def load_proxies(proxy_file="proxy.txt"):
     proxies = []
@@ -360,7 +442,6 @@ def load_proxies(proxy_file="proxy.txt"):
         logger.error(f"خطأ في تحميل البروكسيات: {e}")
     return proxies
 
-
 def save_proxies(proxies, proxy_file="proxy.txt"):
     try:
         with open(proxy_file, "w", encoding="utf-8") as f:
@@ -371,7 +452,6 @@ def save_proxies(proxies, proxy_file="proxy.txt"):
     except Exception as e:
         logger.error(f"خطأ في حفظ البروكسيات: {e}")
         return False
-
 
 def get_ip(proxy, timeout=10):
     if not proxy:
@@ -402,7 +482,6 @@ def get_ip(proxy, timeout=10):
         pass
     return "Unknown"
 
-
 def get_cached_ip(proxy, force_refresh=False):
     if not proxy:
         return "بدون بروكسي"
@@ -417,7 +496,6 @@ def get_cached_ip(proxy, force_refresh=False):
     with ip_cache_lock:
         ip_cache[proxy] = (time.time(), ip)
     return ip
-
 
 def test_proxy_detailed(proxy):
     if not proxy:
@@ -444,59 +522,177 @@ def test_proxy_detailed(proxy):
     
     return {"status": "failed"}
 
-
 def test_proxy(proxy):
     result = test_proxy_detailed(proxy)
     if result["status"] == "working":
         return result["ip"]
     return None
 
-
 def mark_proxy_failed(proxy):
     with proxy_lock:
-        if proxy:
-            proxy_failures[proxy] = proxy_failures.get(proxy, 0) + 1
-            if proxy_failures[proxy] >= 5:
-                logger.warning(f"⚠️ البروكسي {proxy} فشل 5 مرات، حذفه")
-                proxies = load_proxies()
-                if proxy in proxies:
-                    proxies.remove(proxy)
-                    save_proxies(proxies)
+        if not proxy:
+            return
+        
+        proxy_failures[proxy] = proxy_failures.get(proxy, 0) + 1
+        
+        if proxy_failures[proxy] >= 5:
+            logger.warning(f"⚠️ البروكسي {proxy} فشل 5 مرات، حذفه")
+            
+            proxies = load_proxies()
+            if proxy in proxies:
+                proxies.remove(proxy)
+                save_proxies(proxies)
+            
+            # احذف كل الحجوزات المرتبطة بيه
+            try:
+                with _db_lock:
+                    conn = sqlite3.connect(DATABASE_FILE)
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM proxy_reservations WHERE proxy = ?", (proxy,))
+                    conn.commit()
+                    conn.close()
+            except:
+                pass
+            
+            if proxy in proxy_failures:
                 del proxy_failures[proxy]
 
-
-def get_working_proxy(current_proxy=None):
-    with proxy_lock:
-        proxies = load_proxies()
-        if not proxies:
-            return None
-        
-        available = [p for p in proxies if p not in proxy_failures or proxy_failures[p] < 3]
-        if not available:
-            proxy_failures.clear()
-            available = proxies
-        
-        if current_proxy and current_proxy in available:
-            if test_proxy(current_proxy):
-                return current_proxy
-            else:
-                mark_proxy_failed(current_proxy)
-                if current_proxy in available:
-                    available.remove(current_proxy)
-                if not available:
-                    proxy_failures.clear()
-                    available = proxies
-        
-        return random.choice(available) if available else None
-
-
 # ============================================================
+# نظام حجز البروكسيات (كل حساب = IP مختلف)
+# ============================================================
+def get_all_reserved_proxies():
+    """جلب كل البروكسيات المحجوزة {proxy: account_id}"""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT proxy, account_id FROM proxy_reservations WHERE status = 'active'"
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            return {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logger.error(f"خطأ get_all_reserved_proxies: {e}")
+        return {}
+
+def get_account_proxy(account_id):
+    """جلب البروكسي المحجوز لحساب معين"""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT proxy FROM proxy_reservations WHERE account_id = ? AND status = 'active'",
+                (account_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            return row[0] if row else None
+    except:
+        return None
+
+def reserve_proxy(account_id, proxy):
+    """حجز بروكسي لحساب (ذرّي)"""
+    with _proxy_reservation_lock:
+        try:
+            with _db_lock:
+                conn = sqlite3.connect(DATABASE_FILE)
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "SELECT account_id FROM proxy_reservations WHERE proxy = ? AND status = 'active'",
+                    (proxy,)
+                )
+                existing = cursor.fetchone()
+                
+                if existing and existing[0] != account_id:
+                    conn.close()
+                    logger.warning(f"⚠️ البروكسي {proxy} محجوز لحساب {existing[0]}")
+                    return False
+                
+                cursor.execute(
+                    "DELETE FROM proxy_reservations WHERE account_id = ?",
+                    (account_id,)
+                )
+                
+                cursor.execute("""
+                    INSERT INTO proxy_reservations (proxy, account_id, reserved_at, status)
+                    VALUES (?, ?, ?, 'active')
+                """, (proxy, account_id, datetime.now().isoformat()))
+                
+                conn.commit()
+                conn.close()
+                return True
+        except Exception as e:
+            logger.error(f"خطأ reserve_proxy: {e}")
+            return False
+
+def release_proxy(account_id):
+    """تحرير بروكسي حساب"""
+    with _proxy_reservation_lock:
+        try:
+            with _db_lock:
+                conn = sqlite3.connect(DATABASE_FILE)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM proxy_reservations WHERE account_id = ?",
+                    (account_id,)
+                )
+                conn.commit()
+                conn.close()
+                return True
+        except:
+            return False
+
+def find_free_proxy(account_id):
+    """إيجاد بروكسي فاضي للحساب"""
+    proxies = load_proxies()
+    if not proxies:
+        return None, 0
+    
+    existing = get_account_proxy(account_id)
+    if existing and existing in proxies:
+        return existing, proxies.index(existing)
+    
+    reserved = get_all_reserved_proxies()
+    
+    for i, proxy in enumerate(proxies):
+        if proxy not in reserved:
+            if reserve_proxy(account_id, proxy):
+                logger.info(f"✅ حجز بروكسي جديد للحساب {account_id}: {proxy}")
+                return proxy, i
+    
+    logger.warning(f"⚠️ كل البروكسيات ({len(proxies)}) محجوزة! الحساب {account_id} مش هيلاقي بروكسي")
+    return None, 0
+
+def get_proxy_usage_report():
+    """تقرير استخدام البروكسيات"""
+    proxies = load_proxies()
+    reserved = get_all_reserved_proxies()
+    
+    report = {
+        "total_proxies": len(proxies),
+        "reserved": len(reserved),
+        "free": len(proxies) - len(reserved),
+        "details": []
+    }
+    
+    for p in proxies:
+        acc_id = reserved.get(p)
+        report["details"].append({
+            "proxy": p,
+            "account_id": acc_id,
+            "status": "مستخدم" if acc_id else "فاضي"
+        })
+    
+    return report
+    # ============================================================
 # خدمات Mail.tm
 # ============================================================
 mail_monitors = {}
 seen_messages = {}
 verification_codes = {}
-
 
 def safe_str(value):
     if value is None:
@@ -513,14 +709,12 @@ def safe_str(value):
             return str(value)
     return str(value)
 
-
 def clean_html(raw_html):
     if not raw_html:
         return ""
     text = safe_str(raw_html)
     cleanr = re.compile('<.*?>')
     return re.sub(cleanr, " ", text).strip()
-
 
 def get_mail_token(email, password):
     url = f"{MAIL_TM_API}/token"
@@ -531,7 +725,6 @@ def get_mail_token(email, password):
         return None
     except:
         return None
-
 
 def create_mail_account(email=None, password=None):
     url = f"{MAIL_TM_API}/accounts"
@@ -549,7 +742,6 @@ def create_mail_account(email=None, password=None):
         return email, password, False
     except:
         return email, password, False
-
 
 def ensure_mail_account(email, password):
     token = get_mail_token(email, password)
@@ -572,7 +764,6 @@ def ensure_mail_account(email, password):
     
     return False, None
 
-
 def get_mail_messages(token, limit=10):
     url = f"{MAIL_TM_API}/messages"
     headers = {"Authorization": f"Bearer {token}"}
@@ -588,7 +779,6 @@ def get_mail_messages(token, limit=10):
         logger.error(f"خطأ get_mail_messages: {e}")
         return None
 
-
 def get_mail_message(token, message_id):
     url = f"{MAIL_TM_API}/messages/{message_id}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -600,9 +790,8 @@ def get_mail_message(token, message_id):
     except:
         return None
 
-
 def clear_old_slotfruits_messages(email, password):
-    """مسح كل رسائل SlotFruits و FaucetPay القديمة"""
+    """تعليم الرسائل القديمة كـ "مقروءة" لمنع استخدامها"""
     try:
         token = get_mail_token(email, password)
         if not token:
@@ -612,7 +801,7 @@ def clear_old_slotfruits_messages(email, password):
         if not messages:
             return True
         
-        cleared_count = 0
+        marked_count = 0
         
         with mail_lock:
             if email not in seen_messages:
@@ -641,18 +830,17 @@ def clear_old_slotfruits_messages(email, password):
                     
                     if msg_id not in seen_messages[email]:
                         seen_messages[email].add(msg_id)
-                        cleared_count += 1
+                        marked_count += 1
         
-        logger.info(f"🧹 تم تجاهل {cleared_count} رسالة قديمة لـ {email}")
+        logger.info(f"🧹 تم تعليم {marked_count} رسالة قديمة لـ {email}")
         return True
     
     except Exception as e:
         logger.error(f"خطأ في clear_old_slotfruits_messages: {e}")
         return False
 
-
 def extract_code_from_mail(email_data, expected_amount=None):
-    """استخراج كود SlotFruits بدقة عالية"""
+    """استخراج كود SlotFruits بدقة"""
     if not email_data:
         return None
     
@@ -677,11 +865,9 @@ def extract_code_from_mail(email_data, expected_amount=None):
     if not full_text:
         return None
     
-    # تجاهل FaucetPay
     if "faucetpay" in sender or "faucetpay" in subject_lower:
         return None
     
-    # لازم SlotFruits
     is_slotfruits = (
         "slotfruits" in sender or
         "slotfruits" in subject_lower or
@@ -691,7 +877,6 @@ def extract_code_from_mail(email_data, expected_amount=None):
     if not is_slotfruits:
         return None
     
-    # لازم "withdrawal" لو في مبلغ متوقع
     if expected_amount is not None:
         is_withdrawal = (
             "withdrawal" in subject_lower or
@@ -701,7 +886,6 @@ def extract_code_from_mail(email_data, expected_amount=None):
         if not is_withdrawal:
             return None
     
-    # التحقق من المبلغ
     if expected_amount is not None:
         amount_patterns = [
             r"withdrawal\s+amount\s*[:\-]?\s*([\d,]+)\s*(?:COINS|coins)?",
@@ -726,7 +910,6 @@ def extract_code_from_mail(email_data, expected_amount=None):
             else:
                 logger.info(f"✅ المبلغ مطابق: {found_amount} ≈ {expected_amount}")
     
-    # استخراج الكود
     strict_patterns = [
         r"verification\s+code\s*[:\-]\s*([0-9]{4,10})",
         r"verification\s+code\s+([0-9]{4,10})",
@@ -745,7 +928,6 @@ def extract_code_from_mail(email_data, expected_amount=None):
                 logger.info(f"✅ تم استخراج الكود: {code}")
                 return code
     
-    # Fallback
     numbers = re.findall(r'\b(\d{4,6})\b', full_text)
     
     if expected_amount is not None:
@@ -760,7 +942,6 @@ def extract_code_from_mail(email_data, expected_amount=None):
             return num
     
     return None
-
 
 def start_mail_monitor(email, password):
     """بدء مراقبة البريد"""
@@ -841,7 +1022,7 @@ def start_mail_monitor(email, password):
                                         "subject": subject,
                                         "expected_amount": expected_amount
                                     }
-                                logger.info(f"✅ تم استلام كود لـ {email}: {code} (مبلغ: {expected_amount})")
+                                logger.info(f"✅ تم استلام كود لـ {email}: {code}")
                 
                 time.sleep(3)
                 
@@ -866,9 +1047,8 @@ def start_mail_monitor(email, password):
     
     return token
 
-
 def wait_for_code(email, password, timeout=180, expected_amount=None):
-    """انتظار الكود - مع التحقق من المبلغ"""
+    """انتظار الكود - مع تفريغ seen_messages عند إعادة التسجيل"""
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
         token = start_mail_monitor(email, password)
         if not token:
@@ -902,6 +1082,13 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
         elapsed = time.time() - start_time
         if elapsed > 60 and elapsed - last_retry > 60 and retry_attempts < 3:
             logger.info(f"🔄 إعادة التسجيل لـ {email}")
+            
+            # ✅ امسح الرسائل القديمة قبل إعادة التسجيل
+            with mail_lock:
+                if email in seen_messages:
+                    seen_messages[email].clear()
+                    logger.info(f"🧹 تم تفريغ seen_messages لـ {email}")
+            
             try:
                 do_register(email, password)
             except:
@@ -914,7 +1101,6 @@ def wait_for_code(email, password, timeout=180, expected_amount=None):
     logger.warning(f"⏰ انتهى وقت الانتظار لـ {email}")
     return None
 
-
 # ============================================================
 # API اللعبة
 # ============================================================
@@ -923,16 +1109,28 @@ def safe_request(method, url, **kw):
     for attempt in range(3):
         try:
             response = requests.request(method, url, **kw)
+            
+            # ✅ Rate limit
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", 5))
+                logger.warning(f"⏸️ Rate Limit! انتظار {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            
+            # ✅ 401 - التوكن انتهى
+            if response.status_code == 401:
+                logger.warning(f"🔑 401 Unauthorized")
+                return response
+            
             if response.status_code < 500:
                 return response
             time.sleep(1)
-        except:
+        except Exception as e:
+            logger.debug(f"safe_request error: {e}")
             time.sleep(0.5)
     return None
 
-
 def do_register(email, password, proxy=None):
-    """التسجيل في اللعبة"""
     try:
         token = get_mail_token(email, password)
         if not token:
@@ -968,9 +1166,7 @@ def do_register(email, password, proxy=None):
     except Exception as e:
         return False, str(e)
 
-
 def do_login(email, password, proxy=None):
-    """تسجيل الدخول"""
     try:
         url = f"{API_URL}/users/signupFaucetPayLogin"
         payload = {"email": email, "password": password}
@@ -1004,7 +1200,6 @@ def do_login(email, password, proxy=None):
         return token, user_id, balance, credits, "نجاح"
     except Exception as e:
         return None, None, 0, 0, str(e)
-
 
 def check_account_exists_in_slotfruits(email, password, proxy=None):
     """التحقق من الحساب - 3 حالات"""
@@ -1076,9 +1271,7 @@ def check_account_exists_in_slotfruits(email, password, proxy=None):
     except Exception as e:
         return {"exists": False, "error": str(e)}
 
-
 def do_confirm(email, code, proxy=None):
-    """تأكيد الحساب بالكود"""
     try:
         url = f"{API_URL}/users/confirmFaucetPay"
         payload = {"email": email, "code": code}
@@ -1106,9 +1299,7 @@ def do_confirm(email, code, proxy=None):
     except Exception as e:
         return False, None, str(e)
 
-
 def get_user_info(token, proxy=None):
-    """جلب معلومات المستخدم"""
     try:
         url = f"{API_URL}/users/me"
         headers = {
@@ -1130,9 +1321,7 @@ def get_user_info(token, proxy=None):
     except:
         return None
 
-
 def spin_once(token, proxy=None):
-    """الدوران"""
     try:
         headers = {
             "User-Agent": "okhttp/4.12.0",
@@ -1152,7 +1341,6 @@ def spin_once(token, proxy=None):
         return res.json()
     except:
         return None
-
 
 def farm_ads(user_id, proxy=None):
     """تشغيل إعلانات"""
@@ -1206,1021 +1394,7 @@ def farm_ads(user_id, proxy=None):
         return True
     except:
         return False
-
-
-# ============================================================
-# ✅✅✅ الدوال الجديدة (من الكود القديم المعقد)
-# ============================================================
-def get_trx_coin_id(token, proxy=None):
-    """
-    جلب ID العملة TRX ديناميكياً من SlotFruits
-    - نسخة من الكود القديم المعقد
-    """
-    # نتحقق من الكاش أولاً
-    if token in coin_id_cache:
-        cached_time, cached_coin_id = coin_id_cache[token]
-        if (time.time() - cached_time) < 3600:  # ساعة
-            return cached_coin_id
-    
-    query = {
-        "operationName": "getTypeCoinAll",
-        "variables": {},
-        "query": "query getTypeCoinAll {\n  getTypeCoinAll {\n    id\n    sigla\n  }\n}"
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "okhttp/4.12.0"
-    }
-    
-    kw = {"headers": headers, "json": query}
-    if proxy:
-        proxy_clean = proxy.strip()
-        if not proxy_clean.startswith("http://"):
-            proxy_clean = f"http://{proxy_clean}"
-        kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-    
-    try:
-        res = safe_request("POST", GRAPHQL_URL, **kw)
-        if not res:
-            logger.warning(f"⚠️ فشل جلب العملات، استخدام الافتراضي")
-            return DEFAULT_COIN_ID
-        
-        data = res.json()
-        coins = data.get("data", {}).get("getTypeCoinAll", [])
-        
-        for coin in coins:
-            if coin.get("sigla", "").lower() == "trx":
-                trx_id = coin.get("id")
-                if trx_id:
-                    # نحفظ في الكاش
-                    coin_id_cache[token] = (time.time(), trx_id)
-                    logger.info(f"✅ تم جلب TRX coin_id: {trx_id}")
-                    return trx_id
-        
-        logger.warning(f"⚠️ مش لاقي TRX، استخدام الافتراضي")
-        return DEFAULT_COIN_ID
-        
-    except Exception as e:
-        logger.error(f"خطأ في get_trx_coin_id: {e}")
-        return DEFAULT_COIN_ID
-
-
-def execute_initial_sequence(token, user_id, proxy=None):
-    """
-    تنفيذ التسلسل الأولي - نسخة من الكود القديم
-    SlotFruits بتطلب منك تعمل الطلبات دي قبل أي عملية مهمة
-    """
-    try:
-        okhttp_headers = {
-            "User-Agent": "okhttp/4.12.0",
-            "Accept": "application/json, text/plain, */*",
-            "Authorization": f"Bearer {token}"
-        }
-        
-        kw_base = {"headers": okhttp_headers, "timeout": 15}
-        if proxy:
-            proxy_clean = proxy.strip()
-            if not proxy_clean.startswith("http://"):
-                proxy_clean = f"http://{proxy_clean}"
-            kw_base["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-        
-        # 1. getClick
-        safe_request("GET", f"{API_URL}/users/getClick", **kw_base)
-        time.sleep(0.3)
-        
-        # 2. checkVersion
-        safe_request("GET", f"{API_URL}/checkVersion", **kw_base)
-        time.sleep(0.3)
-        
-        # 3. getTimeClick
-        safe_request("GET", f"{API_URL}/users/getTimeClick", **kw_base)
-        time.sleep(0.3)
-        
-        # 4. mobile page
-        if user_id:
-            kw_mobile = {"headers": {"User-Agent": "okhttp/4.12.0"}, "timeout": 15}
-            if proxy:
-                kw_mobile["proxies"] = kw_base.get("proxies", {})
-            safe_request("GET", f"{BASE_URL}/mobile/{user_id}", **kw_mobile)
-            time.sleep(0.3)
-        
-        # 5. dashboard
-        safe_request("GET", f"{BASE_URL}/dashboard", **{
-            "headers": {
-                "User-Agent": "okhttp/4.12.0",
-                "Authorization": f"Bearer {token}"
-            },
-            "timeout": 15,
-            **({"proxies": kw_base["proxies"]} if proxy else {})
-        })
-        time.sleep(0.3)
-        
-        # 6. GraphQL queries
-        gql_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "okhttp/4.12.0"
-        }
-        
-        gql_kw = {"headers": gql_headers, "timeout": 15}
-        if proxy:
-            gql_kw["proxies"] = kw_base["proxies"]
-        
-        # getUser
-        user_query = {
-            "operationName": "getUser",
-            "variables": {},
-            "query": "query getUser {\n  getUser {\n    id\n    balance\n    credits\n    username\n    email\n    admin\n    status\n    createAt\n    log\n    xp\n    level\n    next_level\n    bonus_level\n    address_fp\n    bonus_loyalty\n    total_earn\n    ref\n    statistics_earn {\n      id\n      clicks\n      total\n      typename\n    }\n    typename\n  }\n}"
-        }
-        safe_request("POST", GRAPHQL_URL, json=user_query, **gql_kw)
-        time.sleep(0.3)
-        
-        # getConfig
-        config_query = {
-            "operationName": "getConfig",
-            "variables": {},
-            "query": "query getConfig {\n  getConfig {\n    recapcha_client_key\n    percent_earn_ref\n    percent_earn_ptc_view\n    percent_credits_ptc_view\n    minimum_withdrawal\n    minimum_withdrawal_usd\n    value_max_withdraw_today\n    status_site\n    status_email\n    adBlock\n    captcha\n    createAt\n    contact\n    token_value\n    credits_value\n    percent_swap\n    value_max_swap_today\n    minimum_swap_usd\n    minimum_swap_token\n    xp_ads\n    xp_short_link\n    xp_roll_game\n    xp_survey\n    automatic_payment\n    validate_ip\n    time_faucet\n    survey\n    adsBot\n    __typename\n  }\n}"
-        }
-        safe_request("POST", GRAPHQL_URL, json=config_query, **gql_kw)
-        time.sleep(0.3)
-        
-        # getSpin
-        spin_query = {
-            "operationName": "getSpin",
-            "variables": {},
-            "query": "query getSpin {\n  getSpin {\n    spinOne\n    spinTwo\n    __typename\n  }\n}"
-        }
-        safe_request("POST", GRAPHQL_URL, json=spin_query, **gql_kw)
-        
-        logger.info(f"✅ تم تنفيذ التسلسل الأولي")
-        return True
-        
-    except Exception as e:
-        logger.error(f"خطأ في execute_initial_sequence: {e}")
-        return False
-
-
-def request_withdrawal_code(token, address, amount, coin_id=None, proxy=None):
-    """طلب كود السحب - مع جلب coin_id ديناميكي"""
-    try:
-        # ✅ جلب coin_id ديناميكي
-        if coin_id is None:
-            coin_id = get_trx_coin_id(token, proxy)
-        
-        logger.info(f"💰 طلب سحب {amount} (coin_id: {coin_id})")
-        
-        url = f"{API_URL}/users/requestWithdrawCode"
-        payload = {
-            "input": {
-                "address": address,
-                "value": amount,
-                "token_recaptcha": "token_recaptcha",
-                "id": coin_id,
-                "type_wallet": "FP"
-            }
-        }
-        headers = {
-            "User-Agent": "okhttp/4.12.0",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        kw = {"headers": headers, "data": json.dumps(payload)}
-        if proxy:
-            proxy_clean = proxy.strip()
-            if not proxy_clean.startswith("http://"):
-                proxy_clean = f"http://{proxy_clean}"
-            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-        
-        res = safe_request("POST", url, **kw)
-        if not res:
-            return False, None, "لا يوجد استجابة"
-        
-        data = res.json()
-        logger.info(f"📥 رد طلب الكود: {json.dumps(data, ensure_ascii=False)[:300]}")
-        
-        result = data.get("result", {})
-        if result.get("status") == "success" or data.get("success"):
-            return True, coin_id, "تم إرسال الكود"
-        return False, None, result.get("msg", "فشل طلب الكود")
-    except Exception as e:
-        return False, None, str(e)
-
-
-def confirm_withdrawal(token, address, amount, code, coin_id=None, proxy=None):
-    """تأكيد السحب - مع جلب coin_id ديناميكي + التحقق الصارم"""
-    try:
-        # ✅ جلب coin_id ديناميكي
-        if coin_id is None:
-            coin_id = get_trx_coin_id(token, proxy)
-        
-        url = f"{API_URL}/users/withdraw"
-        payload = {
-            "input": {
-                "address": address,
-                "value": amount,
-                "token_recaptcha": "token_recaptcha",
-                "id": coin_id,
-                "type_wallet": "FP",
-                "code": code
-            }
-        }
-        headers = {
-            "User-Agent": "okhttp/4.12.0",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        kw = {"headers": headers, "data": json.dumps(payload)}
-        if proxy:
-            proxy_clean = proxy.strip()
-            if not proxy_clean.startswith("http://"):
-                proxy_clean = f"http://{proxy_clean}"
-            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-        
-        res = safe_request("POST", url, **kw)
-        if not res:
-            return False, None, "لا يوجد استجابة من السيرفر"
-        
-        try:
-            data = res.json()
-        except:
-            return False, None, f"رد غير صالح: {res.text[:100]}"
-        
-        logger.info(f"📥 رد تأكيد السحب: {json.dumps(data, ensure_ascii=False)[:300]}")
-        
-        result = data.get("result", {}) or {}
-        msg = result.get("msg", "") or data.get("message", "") or ""
-        msg_lower = msg.lower()
-        
-        # ✅ نتحقق من رسائل الخطأ
-        error_keywords = [
-            "incorrect", "invalid", "wrong", "failed", "expired",
-            "not found", "already", "error", "does not exist",
-            "غير صحيح", "خطأ"
-        ]
-        
-        for keyword in error_keywords:
-            if keyword in msg_lower:
-                error_msg = msg or "فشل السحب"
-                logger.error(f"❌ فشل السحب: {error_msg}")
-                return False, None, error_msg
-        
-        # ✅ نتحقق من success الحقيقي
-        is_success = (
-            result.get("status") == "success" or 
-            data.get("success") == True
-        ) and not result.get("needsConfirmation", False)
-        
-        if not is_success:
-            if result.get("needsConfirmation"):
-                return False, None, "السحب محتاج تأكيد إضافي"
-            return False, None, msg or "فشل السحب"
-        
-        # ✅ نحفظ معلومات السحب
-        withdraw_info = data.get("withdraw", {}) or result.get("withdraw", {}) or {}
-        
-        return True, {
-            "data": data,
-            "withdraw_info": withdraw_info,
-            "status": withdraw_info.get("status", 0),
-            "hash": withdraw_info.get("hash", ""),
-            "value": withdraw_info.get("value", amount)
-        }, "تم قبول طلب السحب"
-    
-    except Exception as e:
-        logger.error(f"❌ خطأ في confirm_withdrawal: {e}")
-        return False, None, str(e)
-
-
-# ============================================================
-# [تكملة الكود في الرسالة التالية - AccountWorker]
-# ============================================================
-# ============================================================
-# AccountWorker
-# ============================================================
-class AccountWorker:
-    def __init__(self, email, password, proxy=None, index=0, account_id=None):
-        self.email = email
-        self.password = password
-        self.index = index
-        self.raw_proxy = proxy
-        self.proxy = proxy
-        self.account_id = account_id
-        
-        self.token = None
-        self.user_id = None
-        self.balance = 0
-        self.credits = 0
-        self.total_earned = 0
-        self.spin_count = 0
-        self.fail_count = 0
-        self.max_fails = 5
-        self.trx_coin_id = None  # ✅ نحفظ coin_id
-        
-        self.running = False
-        self.stopped = False
-        self.current_ip = "جاري الجلب..."
-        self.mail_ok = False
-        
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json, text/plain, */*"})
-        
-        self.account = get_account_by_id(account_id) if account_id else None
-        if self.account:
-            self.balance = self.account.get('balance', 0)
-            self.credits = self.account.get('credits', 0)
-            self.total_earned = self.account.get('total_earned', 0)
-            self.token = self.account.get('token')
-            self.user_id = self.account.get('user_id')
-            self.spin_count = self.account.get('spin_count', 0)
-            self.mail_ok = bool(self.account.get('mail_ok', 0))
-            if not self.proxy:
-                self.proxy = self.account.get('proxy')
-                self.raw_proxy = self.proxy
-        
-        self.setup_proxy()
-    
-    def setup_proxy(self):
-        if not self.raw_proxy and USE_PROXIES:
-            proxies = load_proxies()
-            if not proxies:
-                for _ in range(12):
-                    time.sleep(5)
-                    proxies = load_proxies()
-                    if proxies:
-                        break
-            
-            if proxies:
-                self.raw_proxy = proxies[self.index % len(proxies)]
-        
-        self.proxy = self.raw_proxy
-        
-        if self.proxy:
-            self.session.proxies = {
-                "http": self.proxy,
-                "https": self.proxy
-            }
-    
-    def change_proxy(self):
-        if not USE_PROXIES:
-            return False
-        
-        new_proxy = get_working_proxy(self.proxy)
-        if new_proxy and new_proxy != self.proxy:
-            self.proxy = new_proxy
-            self.raw_proxy = new_proxy
-            self.session.proxies = {
-                "http": self.proxy,
-                "https": self.proxy
-            }
-            if self.account_id:
-                update_account(self.account_id, proxy=new_proxy)
-            logger.info(f"🔄 تغيير بروكسي الحساب {self.email}")
-            return True
-        return False
-    
-    def init_network(self):
-        self.setup_proxy()
-        
-        if not self.proxy:
-            self.current_ip = "بدون بروكسي"
-            return
-        
-        self.current_ip = get_ip(self.proxy, timeout=15)
-        
-        retry = 0
-        while self.current_ip == "Unknown" and retry < 3 and self.running:
-            logger.warning(f"⚠️ البروكسي لا يستجيب، إعادة محاولة...")
-            time.sleep(5)
-            if self.change_proxy():
-                self.current_ip = get_ip(self.proxy, timeout=15)
-            retry += 1
-    
-    def login(self):
-        """تسجيل الدخول أو إنشاء حساب"""
-        if not self.email or not self.password:
-            return False
-        
-        for attempt in range(3):
-            try:
-                if USE_PROXIES and self.proxy:
-                    self.session.proxies = {"http": self.proxy, "https": self.proxy}
-                
-                token, user_id, balance, credits, msg = do_login(
-                    self.email, self.password, self.proxy
-                )
-                
-                if token:
-                    self.token = token
-                    self.user_id = user_id
-                    self.balance = balance
-                    self.credits = credits
-                    
-                    if self.account_id:
-                        update_account(
-                            self.account_id,
-                            token=token,
-                            user_id=user_id,
-                            balance=balance,
-                            credits=credits,
-                            last_login=datetime.now().isoformat()
-                        )
-                    
-                    # ✅ نجيب trx_coin_id بعد تسجيل الدخول
-                    self.trx_coin_id = get_trx_coin_id(self.token, self.proxy)
-                    logger.info(f"💰 TRX coin_id: {self.trx_coin_id}")
-                    
-                    # ✅ ننفذ التسلسل الأولي
-                    execute_initial_sequence(self.token, self.user_id, self.proxy)
-                    
-                    logger.info(f"✅ تسجيل الدخول نجح: {self.email}")
-                    return True
-                
-                logger.warning(f"⚠️ محاولة {attempt+1}/3 فشلت: {msg}")
-                
-                if attempt == 0:
-                    logger.info(f"🆕 محاولة تسجيل حساب جديد: {self.email}")
-                    success, reg_msg = do_register(self.email, self.password, self.proxy)
-                    
-                    if success:
-                        code = wait_for_code(self.email, self.password, timeout=180)
-                        if code:
-                            success, token, confirm_msg = do_confirm(self.email, code, self.proxy)
-                            if success:
-                                user_info = get_user_info(token, self.proxy)
-                                if user_info:
-                                    self.user_id = user_info.get("_id")
-                                    self.balance = user_info.get("balance", 0)
-                                    self.credits = user_info.get("credits", 0)
-                                
-                                self.token = token
-                                
-                                if self.account_id:
-                                    update_account(
-                                        self.account_id,
-                                        token=token,
-                                        user_id=self.user_id,
-                                        balance=self.balance,
-                                        credits=self.credits,
-                                        mail_ok=1,
-                                        last_login=datetime.now().isoformat()
-                                    )
-                                
-                                # ✅ نجيب trx_coin_id
-                                self.trx_coin_id = get_trx_coin_id(self.token, self.proxy)
-                                execute_initial_sequence(self.token, self.user_id, self.proxy)
-                                
-                                logger.info(f"✅ تم إنشاء الحساب: {self.email}")
-                                return True
-                
-                if USE_PROXIES:
-                    mark_proxy_failed(self.proxy)
-                    self.change_proxy()
-                
-                time.sleep(5)
-                
-            except Exception as e:
-                logger.error(f"❌ خطأ في تسجيل الدخول {self.email}: {e}")
-                time.sleep(5)
-        
-        logger.error(f"❌ فشل تسجيل الدخول للحساب {self.email}")
-        return False
-    
-    def spin(self):
-        try:
-            if self.credits <= 0:
-                farm_ads(self.user_id, self.proxy)
-                time.sleep(random.uniform(1.0, 2.0))
-                
-                user_info = get_user_info(self.token, self.proxy)
-                if user_info:
-                    self.credits = user_info.get('credits', 0)
-                    self.balance = user_info.get('balance', self.balance)
-            
-            if self.credits <= 0:
-                return None
-            
-            data = spin_once(self.token, self.proxy)
-            if data:
-                reward = data.get("total", 0) or 0
-                user = data.get("user", {})
-                self.balance = user.get("balance", self.balance)
-                self.credits = user.get("credits", 0)
-                
-                if reward > 0:
-                    self.total_earned += reward
-                    self.spin_count += 1
-                
-                if self.account_id:
-                    add_spin(self.account_id, self.spin_count, reward, self.balance, self.credits)
-                    update_account(self.account_id, spin_count=self.spin_count)
-                
-                self.fail_count = 0
-                return data
-            
-            self.fail_count += 1
-            return None
-        except Exception as e:
-            logger.error(f"خطأ في الدوران {self.email}: {e}")
-            self.fail_count += 1
-            return None
-    
-    def check_target(self):
-        if not self.account_id:
-            return False
-        
-        self.account = get_account_by_id(self.account_id)
-        if not self.account:
-            return False
-        
-        today = datetime.now().strftime("%Y-%m-%d")
-        last_date = self.account.get('last_withdraw_date', '') or ''
-        
-        if last_date and last_date != today:
-            new_target = random.randint(MIN_TARGET, MAX_TARGET)
-            update_account(
-                self.account_id,
-                has_withdrawn_today=0,
-                target_amount=new_target
-            )
-            self.account['has_withdrawn_today'] = 0
-            self.account['target_amount'] = new_target
-            self.stopped = False
-            logger.info(f"🔄 تاريخ جديد! الحساب {self.email} استأنف بهدف {new_target:,}")
-            return False
-        
-        if self.account.get('has_withdrawn_today', 0):
-            return True
-        
-        target = self.account.get('target_amount', MIN_TARGET)
-        if self.balance >= target:
-            return self.withdraw()
-        
-        return False
-    
-    def withdraw(self):
-        """السحب التلقائي - مع التحقق من الرصيد"""
-        if self.balance < MIN_WITHDRAW:
-            logger.warning(f"⚠️ الرصيد {self.balance} أقل من الحد الأدنى {MIN_WITHDRAW}")
-            return False
-        
-        if not self.mail_ok:
-            logger.warning(f"⚠️ لا يمكن السحب لـ {self.email}: البريد غير متاح")
-            return False
-        
-        # ✅ السحب بالمبلغ كامل
-        amount = int(self.balance)
-        
-        try:
-            address = self.email
-            password = self.password
-            
-            # ✅ 1. نتأكد إن عندنا coin_id
-            if not self.trx_coin_id:
-                self.trx_coin_id = get_trx_coin_id(self.token, self.proxy)
-            
-            # ✅ 2. ننفذ التسلسل الأولي
-            logger.info(f"🔄 تنفيذ التسلسل الأولي...")
-            execute_initial_sequence(self.token, self.user_id, self.proxy)
-            
-            # ✅ 3. نمسح الرسائل القديمة
-            logger.info(f"🧹 مسح الرسائل القديمة لـ {self.email}")
-            try:
-                clear_old_slotfruits_messages(address, password)
-            except Exception as e:
-                logger.warning(f"⚠️ فشل مسح الرسائل القديمة: {e}")
-            
-            # ✅ 4. نطلب كود السحب
-            success = False
-            coin_id = None
-            
-            for attempt in range(3):
-                if USE_PROXIES and self.proxy:
-                    self.session.proxies = {"http": self.proxy, "https": self.proxy}
-                
-                success, coin_id, message = request_withdrawal_code(
-                    self.token, address, amount, 
-                    coin_id=self.trx_coin_id,
-                    proxy=self.proxy
-                )
-                
-                if success:
-                    break
-                
-                logger.warning(f"⚠️ محاولة {attempt+1}/3 لطلب كود السحب: {message}")
-                
-                if USE_PROXIES:
-                    mark_proxy_failed(self.proxy)
-                    self.change_proxy()
-                
-                time.sleep(5)
-            
-            if not success:
-                logger.error(f"❌ فشل طلب كود السحب للحساب {self.email}: {message}")
-                
-                if self.account_id:
-                    add_withdrawal(self.account_id, amount, address, "FP", "failed")
-                
-                return False
-            
-            # ✅ 5. ننتظر الكود
-            logger.info(f"📬 انتظار كود السحب (مبلغ: {amount})...")
-            code = wait_for_code(address, password, timeout=180, expected_amount=amount)
-            
-            if not code:
-                logger.error(f"❌ انتهى وقت انتظار كود السحب {self.email}")
-                
-                if self.account_id:
-                    add_withdrawal(self.account_id, amount, address, "FP", "failed")
-                
-                return False
-            
-            logger.info(f"✅ تم استلام الكود: {code}")
-            
-            # ✅ 6. نأكد السحب
-            success, result, error = confirm_withdrawal(
-                self.token, address, amount, code,
-                coin_id=coin_id,
-                proxy=self.proxy
-            )
-            
-            if not success:
-                logger.error(f"❌ فشل التأكيد: {error}")
-                
-                if self.account_id:
-                    add_withdrawal(self.account_id, amount, address, "FP", "failed")
-                
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_notification(
-                            f"❌ <b>فشل السحب</b>\n"
-                            f"━━━━━━━━━━━━━━━━━\n"
-                            f"📧 {self.email}\n"
-                            f"💰 المبلغ: {amount:,.0f}\n"
-                            f"⚠️ <b>السبب:</b> {error}"
-                        ),
-                        asyncio.get_event_loop()
-                    )
-                except:
-                    pass
-                
-                return False
-            
-            # ✅ 7. نتحقق من الرصيد
-            logger.info(f"🔍 التحقق من الرصيد بعد السحب...")
-            time.sleep(3)
-            
-            balance_before = self.balance
-            verified_balance = None
-            
-            for verify_attempt in range(3):
-                user_info = get_user_info(self.token, self.proxy)
-                if user_info:
-                    verified_balance = user_info.get("balance", balance_before)
-                    break
-                time.sleep(2)
-            
-            if verified_balance is None:
-                verified_balance = balance_before
-            
-            balance_decreased = verified_balance < balance_before - 10
-            
-            if not balance_decreased:
-                logger.error(f"❌ السحب مش اتم! الرصيد: {verified_balance} (كان {balance_before})")
-                
-                if self.account_id:
-                    add_withdrawal(self.account_id, amount, address, "FP", "failed")
-                
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_notification(
-                            f"❌ <b>فشل السحب</b>\n"
-                            f"━━━━━━━━━━━━━━━━━\n"
-                            f"📧 {self.email}\n"
-                            f"💰 المبلغ المطلوب: {amount:,.0f}\n"
-                            f"💰 الرصيد الحالي: {verified_balance:,.0f}\n"
-                            f"⚠️ <b>السبب: السحب لم يتم</b>"
-                        ),
-                        asyncio.get_event_loop()
-                    )
-                except:
-                    pass
-                
-                return False
-            
-            # ✅ الرصيد نقص = السحب اتم
-            actual_amount = balance_before - verified_balance
-            logger.info(f"✅ السحب اتم! الرصيد: {verified_balance} (كان {balance_before})")
-            
-            if self.account_id:
-                add_withdrawal(self.account_id, actual_amount, address, "FP", "completed")
-                
-                today = datetime.now().strftime("%Y-%m-%d")
-                update_account(
-                    self.account_id,
-                    balance=verified_balance,
-                    withdrawal_count=(self.account.get('withdrawal_count', 0) + 1),
-                    last_withdrawal=datetime.now().isoformat(),
-                    has_withdrawn_today=1,
-                    last_withdraw_date=today
-                )
-            
-            self.balance = verified_balance
-            
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    send_notification(
-                        f"💰 <b>تم السحب بنجاح!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━\n"
-                        f"📧 {self.email}\n"
-                        f"💰 المبلغ: {actual_amount:,.0f}\n"
-                        f"💰 الرصيد الجديد: {verified_balance:,.0f}\n"
-                        f"🌐 IP: {self.current_ip}\n"
-                        f"✅ تم التحويل"
-                    ),
-                    asyncio.get_event_loop()
-                )
-            except:
-                pass
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"❌ خطأ في السحب {self.email}: {e}")
-            
-            if self.account_id:
-                add_withdrawal(self.account_id, amount, address, "FP", "failed")
-            
-            return False
-    
-    def run(self):
-        self.init_network()
-        
-        if not self.login():
-            self.running = False
-            return
-        
-        self.running = True
-        
-        while self.running and not is_shutting_down:
-            try:
-                if self.check_target():
-                    self.stopped = True
-                    logger.info(f"⏸️ الحساب {self.email} متوقف بعد السحب")
-                    
-                    while self.stopped and self.running and not is_shutting_down:
-                        time.sleep(60)
-                        
-                        today = datetime.now().strftime("%Y-%m-%d")
-                        self.account = get_account_by_id(self.account_id)
-                        if self.account:
-                            last_date = self.account.get('last_withdraw_date', '') or ''
-                            if last_date and last_date != today:
-                                self.stopped = False
-                                logger.info(f"🔄 الحساب {self.email} استأنف بيوم جديد")
-                                break
-                    continue
-                
-                for _ in range(5):
-                    if not self.running or self.stopped or is_shutting_down:
-                        return
-                    
-                    result = self.spin()
-                    
-                    if result is None and self.fail_count >= self.max_fails:
-                        logger.warning(f"⚠️ فشل متكرر للحساب {self.email}، تغيير البروكسي...")
-                        if USE_PROXIES:
-                            if self.change_proxy():
-                                if self.login():
-                                    self.fail_count = 0
-                        break
-                    
-                    time.sleep(random.uniform(1.0, 4.0))
-                
-                if self.account_id:
-                    try:
-                        update_account(
-                            self.account_id,
-                            balance=self.balance,
-                            credits=self.credits,
-                            total_earned=self.total_earned
-                        )
-                    except:
-                        pass
-                
-                time.sleep(random.uniform(3.0, 8.0))
-            except Exception as e:
-                logger.error(f"❌ خطأ في حلقة {self.email}: {e}")
-                time.sleep(10)
-        
-        self.running = False
-        logger.info(f"⏹️ توقف الحساب {self.email}")
-
-
-# ============================================================
-# BotManager
-# ============================================================
-class BotManager:
-    def __init__(self):
-        self.workers = {}
-        self.threads = {}
-        self.running = False
-        self.chat_id = None
-        self.dashboard_page = 0
-        self.delete_page = 0
-    
-    def start_account(self, account_id):
-        with worker_lock:
-            if account_id in self.workers:
-                worker = self.workers[account_id]
-                if worker.running:
-                    return False
-            
-            account = get_account_by_id(account_id)
-            if not account:
-                return False
-            
-            proxies = load_proxies()
-            proxy = None
-            proxy_index = 0
-            
-            if USE_PROXIES and proxies:
-                proxy_index = account_id % len(proxies)
-                proxy = proxies[proxy_index]
-            
-            worker = AccountWorker(
-                email=account['email'],
-                password=account['password'],
-                proxy=proxy,
-                index=proxy_index,
-                account_id=account_id
-            )
-            
-            if proxy:
-                update_account(account_id, proxy=proxy, proxy_index=proxy_index)
-            
-            self.workers[account_id] = worker
-            
-            thread = threading.Thread(target=worker.run, daemon=True)
-            thread.start()
-            self.threads[account_id] = thread
-            
-            return True
-    
-    def stop_account(self, account_id):
-        with worker_lock:
-            if account_id not in self.workers:
-                return False
-            
-            worker = self.workers[account_id]
-            worker.running = False
-            worker.stopped = True
-            
-            if account_id in self.threads:
-                try:
-                    self.threads[account_id].join(timeout=5)
-                except:
-                    pass
-                del self.threads[account_id]
-            
-            del self.workers[account_id]
-            return True
-    
-    def start_all(self):
-        accounts = get_all_accounts(active_only=True)
-        started = 0
-        
-        for acc in accounts:
-            if self.start_account(acc['id']):
-                started += 1
-                time.sleep(0.3)
-        
-        self.running = True
-        return started
-    
-    def stop_all(self):
-        account_ids = list(self.workers.keys())
-        stopped = 0
-        
-        for acc_id in account_ids:
-            if self.stop_account(acc_id):
-                stopped += 1
-        
-        self.running = False
-        return stopped
-    
-    def get_status(self):
-        accounts = get_all_accounts()
-        total = len(accounts)
-        running = len(self.workers)
-        
-        total_balance = 0
-        details = []
-        
-        for acc in accounts:
-            total_balance += acc.get('balance', 0)
-            
-            worker = self.workers.get(acc['id'])
-            mail_ok = bool(acc.get('mail_ok', 0))
-            
-            if worker:
-                status_icon = "🟢"
-                if worker.stopped:
-                    status_icon = "✅"
-                current_ip = worker.current_ip
-                balance = worker.balance
-                credits = worker.credits
-                target = worker.account.get('target_amount', 0) if worker.account else 0
-            else:
-                status_icon = "🔴"
-                if acc.get('has_withdrawn_today', 0):
-                    status_icon = "✅"
-                
-                proxy = acc.get('proxy')
-                current_ip = get_cached_ip(proxy) if proxy else "بدون"
-                balance = acc.get('balance', 0)
-                credits = acc.get('credits', 0)
-                target = acc.get('target_amount', 0)
-            
-            if current_ip and current_ip != "Unknown" and current_ip != "بدون بروكسي":
-                ip_short = current_ip.split('.')[-1]
-            else:
-                ip_short = "---"
-            
-            details.append({
-                'id': acc['id'],
-                'email': acc['email'],
-                'status_icon': status_icon,
-                'balance': balance,
-                'credits': credits,
-                'target': target,
-                'ip': current_ip,
-                'ip_short': ip_short,
-                'mail_ok': mail_ok,
-                'account_type': acc.get('account_type', 'existing')
-            })
-        
-        return {
-            'total_accounts': total,
-            'running_accounts': running,
-            'total_balance': total_balance,
-            'details': details
-        }
-    
-    def dashboard_text(self, page=0):
-        status = self.get_status()
-        
-        total_accounts = status['total_accounts']
-        total_pages = max(1, ((total_accounts - 1) // ITEMS_PER_PAGE) + 1)
-        
-        if page >= total_pages:
-            page = total_pages - 1
-        if page < 0:
-            page = 0
-        
-        start = page * ITEMS_PER_PAGE
-        end = min(start + ITEMS_PER_PAGE, total_accounts)
-        
-        mail_ok_count = sum(1 for d in status['details'] if d['mail_ok'])
-        mail_bad_count = total_accounts - mail_ok_count
-        
-        text = (
-            f"📊 <b>لوحة التحكم</b> (صفحة {page+1}/{total_pages})\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"📧 إجمالي الحسابات: {status['total_accounts']}\n"
-            f"🟢 النشطة: {status['running_accounts']}\n"
-            f"💰 الرصيد الكلي: {status['total_balance']:,.0f}\n"
-            f"📬 بريد شغال: {mail_ok_count} | 📭 مش شغال: {mail_bad_count}\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"<b>تفاصيل الحسابات:</b>\n"
-        )
-        
-        if status['details']:
-            for detail in status['details'][start:end]:
-                mail_icon = "📬" if detail['mail_ok'] else "📭"
-                text += (
-                    f"{detail['status_icon']} <b>{detail['id']}</b> {mail_icon} | "
-                    f"{detail['email'][:15]}\n"
-                    f"   💰{detail['balance']:,.0f} | "
-                    f"🎯{detail['credits']} | "
-                    f"🎯{detail['target']:,}\n"
-                    f"   🌐 IP: <code>{detail['ip']}</code>\n"
-                )
-        else:
-            text += "⚠️ لا توجد حسابات"
-        
-        text += f"\n━━━━━━━━━━━━━━━━━\n🔄 {datetime.now().strftime('%H:%M:%S')}"
-        
-        return text, page, total_pages
-
-
-bot_manager = BotManager()
-
-
-# ============================================================
+        # ============================================================
 # دالة الإضافة الذكية
 # ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False,
@@ -2230,17 +1404,30 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
         if silent:
             progress_msg = None
         
-        if forced_proxy is not None:
-            proxy = forced_proxy
-            proxy_index = forced_proxy_index if forced_proxy_index is not None else 0
-        else:
-            proxies = load_proxies()
-            proxy = None
-            proxy_index = 0
-            if USE_PROXIES and proxies:
-                account_count = len(get_all_accounts())
-                proxy_index = account_count % len(proxies)
-                proxy = proxies[proxy_index]
+        # ✅ حجز بروكسي
+        proxy = None
+        proxy_index = 0
+        
+        if USE_PROXIES:
+            if forced_proxy is not None:
+                proxy = forced_proxy
+                proxy_index = forced_proxy_index if forced_proxy_index is not None else 0
+            else:
+                # احفظ الحساب أولاً عشان نقدر نحجزله بروكسي
+                existing = get_account_by_email(email)
+                if existing:
+                    temp_account_id = existing['id']
+                else:
+                    temp_account_id = add_account(
+                        email, password, 
+                        proxy=None, proxy_index=0,
+                        mail_ok=0, account_type='existing'
+                    )
+                
+                if temp_account_id:
+                    proxy, proxy_index = find_free_proxy(temp_account_id)
+                    if proxy:
+                        update_account(temp_account_id, proxy=proxy, proxy_index=proxy_index)
         
         if progress_msg:
             try:
@@ -2311,7 +1498,9 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 )
                 action = "إضافة"
             
-            if account_id:
+            # ✅ احجز البروكسي للحساب بشكل نهائي
+            if account_id and proxy:
+                reserve_proxy(account_id, proxy)
                 bot_manager.start_account(account_id)
                 
                 if progress_msg and not silent:
@@ -2323,7 +1512,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                                 f"🆔 ID: {account_id}\n"
                                 f"📧 {email}\n"
                                 f"💰 الرصيد: {account_check.get('balance', 0):,.0f}\n"
-                                f"📬 البريد: ✅ شغال",
+                                f"📬 البريد: ✅ شغال\n"
+                                f"🌐 البروكسي: {proxy}",
                                 parse_mode="HTML"
                             )
                         else:
@@ -2383,27 +1573,11 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             code = wait_for_code(email, password, timeout=180)
             
             if not code:
-                if progress_msg and not silent:
-                    try:
-                        await progress_msg.edit_text(
-                            f"❌ <b>انتهى وقت الانتظار</b>\n📧 {email}",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
                 return False
             
             success, token, confirm_msg = do_confirm(email, code, proxy)
             
             if not success:
-                if progress_msg and not silent:
-                    try:
-                        await progress_msg.edit_text(
-                            f"❌ <b>فشل التأكيد</b>\n📧 {email}",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
                 return False
             
             user_info = get_user_info(token, proxy)
@@ -2440,6 +1614,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 )
             
             if account_id:
+                if proxy:
+                    reserve_proxy(account_id, proxy)
                 bot_manager.start_account(account_id)
                 
                 if progress_msg and not silent:
@@ -2447,7 +1623,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                         await progress_msg.edit_text(
                             f"✅ <b>تم التأكيد بنجاح!</b>\n"
                             f"🆔 ID: {account_id}\n"
-                            f"📧 {email}",
+                            f"📧 {email}\n"
+                            f"🌐 البروكسي: {proxy}",
                             parse_mode="HTML"
                         )
                     except:
@@ -2516,6 +1693,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             )
             
             if account_id:
+                if proxy:
+                    reserve_proxy(account_id, proxy)
                 bot_manager.start_account(account_id)
                 
                 if progress_msg and not silent:
@@ -2524,7 +1703,8 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                             f"✅ <b>تم إنشاء الحساب!</b>\n"
                             f"🆔 ID: {account_id}\n"
                             f"📧 {email}\n"
-                            f"💰 الرصيد: {balance:,.0f}",
+                            f"💰 الرصيد: {balance:,.0f}\n"
+                            f"🌐 البروكسي: {proxy}",
                             parse_mode="HTML"
                         )
                     except:
@@ -2533,7 +1713,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
             
             return False
         
-        # حالة غير معروفة
         error_msg = account_check.get("error") or account_check.get("message") or "غير معروف"
         
         if progress_msg and not silent:
@@ -2556,24 +1735,24 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                 pass
         return False
 
-
-# ============================================================
-# [تكملة الكود في الرسالة التالية - Telegram + main]
-# ============================================================
 # ============================================================
 # دوال التليجرام
 # ============================================================
 async def send_notification(message):
-    if bot_application and bot_chat_id:
-        try:
-            await bot_application.bot.send_message(
-                chat_id=bot_chat_id,
-                text=message,
-                parse_mode="HTML"
-            )
-        except:
-            pass
-
+    """إشعار async - للاستخدام من داخل البوت"""
+    target_chat = bot_chat_id or (bot_manager.chat_id if bot_manager else None)
+    
+    if not bot_application or not target_chat:
+        return
+    
+    try:
+        await bot_application.bot.send_message(
+            chat_id=target_chat,
+            text=message,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"فشل إرسال إشعار: {e}")
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
@@ -2587,7 +1766,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("💰 سحب يدوي", callback_data="manual_withdraw")],
         [InlineKeyboardButton("📥 حالات السحب", callback_data="withdrawal_status")],
     ])
-
 
 async def show_main_menu(update, context, chat_id):
     status = bot_manager.get_status()
@@ -2624,7 +1802,6 @@ async def show_main_menu(update, context, chat_id):
             parse_mode="HTML"
         )
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_chat_id, bot_application
     
@@ -2632,8 +1809,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_application = context.application
     bot_manager.chat_id = update.message.chat_id
     
+    save_chat_id(bot_chat_id)
+    
     await show_main_menu(None, context, update.message.chat_id)
-
 
 # ============================================================
 # معالج الأزرار
@@ -2651,7 +1829,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
     
-    # ============ تشغيل / إيقاف ============
     if data == "start_all":
         started = bot_manager.start_all()
         await query.edit_message_text(f"🚀 تم تشغيل {started} حساب")
@@ -2664,7 +1841,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(1)
         await show_main_menu(update, context, query.message.chat_id)
     
-    # ============ لوحة التحكم ============
     elif data.startswith("dashboard_"):
         try:
             page = int(data.split("_")[1])
@@ -2692,7 +1868,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ============ إضافة حساب ============
     elif data == "add_account":
         pending_emails[user_id] = "waiting_for_account"
         await query.edit_message_text(
@@ -2715,7 +1890,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     
-    # ============ حذف حساب ============
     elif data == "delete_account":
         bot_manager.delete_page = 0
         await show_delete_accounts(update, context)
@@ -2744,18 +1918,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(1)
         await show_delete_accounts(update, context)
     
-    # ============ إدارة البروكسيات ============
     elif data == "proxies_menu":
         proxies = load_proxies()
+        reserved = get_all_reserved_proxies()
+        
         keyboard = [
-            [InlineKeyboardButton("📋 عرض البروكسيات", callback_data="view_proxies")],
+            [InlineKeyboardButton(f"📋 عرض البروكسيات ({len(proxies)})", callback_data="view_proxies")],
+            [InlineKeyboardButton(f"📊 تقرير الحجز ({len(reserved)} محجوز)", callback_data="proxy_report")],
             [InlineKeyboardButton("➕ إضافة بروكسيات", callback_data="add_proxies")],
             [InlineKeyboardButton("🧪 اختبار البروكسيات", callback_data="test_proxies")],
             [InlineKeyboardButton("🗑️ حذف بروكسي", callback_data="delete_proxy")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
         ]
         await query.edit_message_text(
-            f"🌐 <b>إدارة البروكسيات</b>\n━━━━━━━━━━━━━━━━━\n📊 المجموع: {len(proxies)}",
+            f"🌐 <b>إدارة البروكسيات</b>\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"📊 المجموع: {len(proxies)}\n"
+            f"🔒 محجوز: {len(reserved)}\n"
+            f"✅ فاضي: {len(proxies) - len(reserved)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    
+    elif data == "proxy_report":
+        report = get_proxy_usage_report()
+        
+        text = (
+            f"🌐 <b>تقرير البروكسيات</b>\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"📊 إجمالي: {report['total_proxies']}\n"
+            f"🔒 محجوز: {report['reserved']}\n"
+            f"✅ فاضي: {report['free']}\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+        )
+        
+        for d in report['details'][:30]:
+            if d['status'] == "مستخدم":
+                text += f"🔒 <code>{d['proxy']}</code>\n   → حساب #{d['account_id']}\n\n"
+            else:
+                text += f"✅ <code>{d['proxy']}</code> (فاضي)\n\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="proxies_menu")]]
+        await query.edit_message_text(
+            text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
@@ -2869,7 +2074,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(1)
         await button_handler(update, context)
     
-    # ============ سحب يدوي ============
     elif data == "manual_withdraw":
         accounts = get_all_accounts()
         available = [a for a in accounts if a.get('balance', 0) >= MIN_WITHDRAW and a.get('mail_ok', 0)]
@@ -2941,8 +2145,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker.credits = account.get('credits', 0)
         worker.account = account
         worker.mail_ok = True
-        
-        # نجيب trx_coin_id
         worker.trx_coin_id = get_trx_coin_id(worker.token, worker.proxy)
         
         success = worker.withdraw()
@@ -2962,9 +2164,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"❌ <b>فشل السحب</b>\n"
                 f"━━━━━━━━━━━━━━━━━\n"
-                f"💰 الرصيد الحالي: {new_balance:,.0f}\n"
-                f"⚠️ الكود غلط أو العملة غير صحيحة\n"
-                f"💡 حاول مرة أخرى",
+                f"💰 الرصيد الحالي: {new_balance:,.0f}",
                 parse_mode="HTML"
             )
         
@@ -2974,7 +2174,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         await show_main_menu(update, context, query.message.chat_id)
     
-    # ============ حالات السحب ============
     elif data == "withdrawal_status":
         accounts = get_all_accounts()
         if not accounts:
@@ -3038,10 +2237,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     
-    # ============ رجوع ============
     elif data == "back_main":
         await show_main_menu(update, context, query.message.chat_id)
-
 
 async def show_delete_accounts(update, context):
     query = update.callback_query
@@ -3092,7 +2289,6 @@ async def show_delete_accounts(update, context):
         parse_mode="HTML"
     )
 
-
 # ============================================================
 # معالج الرسائل النصية
 # ============================================================
@@ -3108,7 +2304,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     action = pending_emails.get(user_id)
     
-    # ============ إضافة حساب واحد ============
     if action == "waiting_for_account":
         parts = text.split()
         if len(parts) < 2:
@@ -3135,7 +2330,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_single_account(email, password, progress)
         await show_main_menu(None, context, update.message.chat_id)
     
-    # ============ إضافة حسابات متعددة (متوازية) ============
     elif action == "waiting_for_multiple_accounts":
         lines = text.strip().split('\n')
         accounts_data = []
@@ -3170,21 +2364,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         results = {}
         results_lock = threading.Lock()
-        account_counter = [0]
-        counter_lock = threading.Lock()
         
         def process_account(idx, email, password):
             try:
-                with counter_lock:
-                    account_number = account_counter[0]
-                    account_counter[0] += 1
+                # ✅ احجز بروكسي قبل الإضافة
+                existing = get_account_by_email(email)
+                temp_id = existing['id'] if existing else None
+                
+                if not temp_id:
+                    temp_id = add_account(
+                        email, password,
+                        proxy=None, proxy_index=0,
+                        mail_ok=0, account_type='existing'
+                    )
                 
                 assigned_proxy = None
                 assigned_proxy_index = 0
                 
-                if USE_PROXIES and proxies:
-                    assigned_proxy_index = account_number % len(proxies)
-                    assigned_proxy = proxies[assigned_proxy_index]
+                if USE_PROXIES and temp_id:
+                    assigned_proxy, assigned_proxy_index = find_free_proxy(temp_id)
                 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -3289,7 +2487,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await show_main_menu(None, context, update.message.chat_id)
     
-    # ============ إضافة بروكسيات ============
     elif action == "waiting_for_proxies":
         proxies = [p.strip() for p in text.split('\n') if p.strip()]
         current = load_proxies()
@@ -3314,7 +2511,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ أمر غير معروف. استخدم /start للبدء.")
 
-
 # ============================================================
 # أوامر إضافية
 # ============================================================
@@ -3323,7 +2519,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in pending_emails:
         del pending_emails[user_id]
     await update.message.reply_text("❌ تم إلغاء العملية!")
-
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_manager.chat_id = update.message.chat_id
@@ -3339,18 +2534,23 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-
 # ============================================================
 # الوظيفة الرئيسية
 # ============================================================
 def main():
-    global bot_application, is_shutting_down
+    global bot_application, is_shutting_down, bot_chat_id
     
     init_database()
     
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ الرجاء تعيين BOT_TOKEN في config.json")
         return
+    
+    # ✅ استرجع chat_id المحفوظ
+    bot_chat_id = load_chat_id()
+    if bot_chat_id:
+        bot_manager.chat_id = bot_chat_id
+        logger.info(f"✅ تم استرجاع chat_id: {bot_chat_id}")
     
     application = Application.builder().token(BOT_TOKEN).build()
     bot_application = application
@@ -3364,15 +2564,20 @@ def main():
     print("🎰 Starting Slot Bot - النسخة النهائية الكاملة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
-    print("💰 get_trx_coin_id (ديناميكي): مفعل")
-    print("🔄 execute_initial_sequence: مفعل")
+    print("💰 get_trx_coin_id (ديناميكي + كاش ذكي): مفعل")
+    print("🔄 execute_initial_sequence (كل 30 دقيقة): مفعل")
     print("📧 مراقبة البريد (فلتر + المبلغ): مفعل")
     print("🧹 مسح الرسائل القديمة: مفعل")
     print("🔍 التحقق من الرصيد بعد السحب: مفعل")
     print("💸 السحب بالمبلغ كامل: مفعل")
     print("📬 دعم needs_confirmation: مفعل")
     print("➕ إضافة متعددة (متوازي): مفعل")
-    print("🌐 بروكسي مخصص لكل حساب: مفعل")
+    print("🌐 حجز بروكسي فريد لكل حساب: مفعل ✅")
+    print("📢 إشعارات sync: مفعل ✅")
+    print("💾 حفظ chat_id دائم: مفعل ✅")
+    print("⏸️ معالجة Rate Limit 429: مفعل ✅")
+    print("🎯 فحص الهدف كل 10 spins: مفعل ✅")
+    print("📏 هامش مرونة في الهدف: مفعل ✅")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     try:
@@ -3383,7 +2588,6 @@ def main():
         bot_manager.stop_all()
         print("✅ All accounts stopped")
         print("👋 Goodbye!")
-
 
 if __name__ == "__main__":
     main()
