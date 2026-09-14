@@ -3,15 +3,10 @@
   "base_url": "https://slotfruits.com",
   "mail_tm_api": "https://api.mail.tm",
   "mail_tm_domain": "@uberip.com",
-  "timeout": 60,
-  "min_withdraw": 1000,
-  "min_target": 55000,
-  "max_target": 65000,
+  "timeout": 90,
   "use_proxies": true,
   "session_based_proxy": true,
   "session_prefix": "acc",
-  "faucetpay_email": "amemo0536@gmail.com",
-  "withdraw_coin": "trx",
   "database_file": "accounts.db",
   "items_per_page": 25
 }
