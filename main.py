@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Slot Bot - نسخة بدون سحب
-- السحب محذوف بالكامل (تلقائي + يدوي)
-- الحسابات تشتغل 24/7 بدون توقف
-- نظام التسجيل موجود عادي
-- لوحة تحكم محسّنة
+Slot Bot - نسخة بدون سحب (معدّلة)
+- السحب محذوف بالكامل
+- الحسابات تشتغل 24/7
+- إيقاف/تشغيل بدون مشاكل (stop_event)
 """
 
 import os
@@ -305,18 +304,6 @@ def add_spin(account_id, spin_number, reward, balance, credits):
         return True
     except:
         return False
-
-
-def get_total_spins():
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT SUM(spin_count) FROM accounts")
-        result = cursor.fetchone()[0] or 0
-        conn.close()
-        return int(result)
-    except:
-        return 0
 
 
 # ============================================================
@@ -1244,6 +1231,7 @@ class AccountWorker:
 
         self.running = False
         self.stopped = False
+        self.stop_event = threading.Event()   # ✅ جديد
         self.current_ip = "جاري الجلب..."
         self.mail_ok = False
         self.last_error = ""
@@ -1490,6 +1478,7 @@ class AccountWorker:
 
     def run(self):
         self.running = True
+        self.stop_event.clear()   # ✅ جديد
 
         self.init_network()
 
@@ -1499,10 +1488,10 @@ class AccountWorker:
                 update_account(self.account_id, is_active=0)
             return
 
-        while self.running and not is_shutting_down:
+        while self.running and not is_shutting_down and not self.stop_event.is_set():
             try:
                 for _ in range(5):
-                    if not self.running or is_shutting_down:
+                    if not self.running or is_shutting_down or self.stop_event.is_set():
                         return
 
                     result = self.spin()
@@ -1515,7 +1504,10 @@ class AccountWorker:
                                     self.fail_count = 0
                         break
 
-                    time.sleep(random.uniform(1.0, 4.0))
+                    # ✅ نستخدم stop_event.wait بدل time.sleep عشان يقف فوراً
+                    if self.stop_event.wait(random.uniform(1.0, 4.0)):
+                        logger.info(f"⏹️ إيقاف فوري للحساب {self.email}")
+                        return
 
                 if self.account_id:
                     try:
@@ -1528,17 +1520,21 @@ class AccountWorker:
                     except:
                         pass
 
-                time.sleep(random.uniform(3.0, 8.0))
+                if self.stop_event.wait(random.uniform(3.0, 8.0)):
+                    logger.info(f"⏹️ إيقاف فوري للحساب {self.email}")
+                    return
+
             except Exception as e:
                 logger.error(f"❌ خطأ في حلقة {self.email}: {e}")
-                time.sleep(10)
+                if self.stop_event.wait(10):
+                    return
 
         self.running = False
         logger.info(f"⏹️ توقف الحساب {self.email}")
 
 
 # ============================================================
-# BotManager — إدارة الحسابات
+# BotManager — إدارة الحسابات (معدّل)
 # ============================================================
 class BotManager:
     def __init__(self):
@@ -1551,49 +1547,73 @@ class BotManager:
 
     def start_account(self, account_id):
         with worker_lock:
+            # ✅ لو فيه Worker قديم، نوقفه وننضفه الأول
             if account_id in self.workers:
-                worker = self.workers[account_id]
-                if worker.running:
+                old_worker = self.workers[account_id]
+                if old_worker.running and not old_worker.stop_event.is_set():
+                    logger.warning(f"⚠️ الحساب {account_id} شغال بالفعل، لا يمكن تشغيله مرتين")
                     return False
 
-            account = get_account_by_id(account_id)
-            if not account:
-                return False
+                # لو موجود بس مش شغال — ننضفه
+                logger.info(f"🧹 تنظيف Worker قديم للحساب {account_id}")
+                old_worker.running = False
+                old_worker.stopped = True
+                old_worker.stop_event.set()
 
-            proxies = load_proxies()
-            proxy = None
-            proxy_index = 0
+                if account_id in self.threads:
+                    try:
+                        self.threads[account_id].join(timeout=5)
+                    except:
+                        pass
+                    del self.threads[account_id]
 
-            if USE_PROXIES and proxies:
-                base_proxy = proxies[0]
+                del self.workers[account_id]
 
-                if SESSION_BASED_PROXY and is_session_proxy(base_proxy):
-                    proxy = build_session_proxy(account_id, base_proxy, SESSION_PREFIX)
-                    proxy_index = 0
-                    logger.info(f"🔀 Session proxy للحساب {account_id}")
-                else:
-                    proxy_index = account_id % len(proxies)
-                    proxy = proxies[proxy_index]
-                    logger.info(f"🌐 Proxy #{proxy_index} للحساب {account_id}")
+        # ✅ نتأكد إن الـ Thread القديم خلص فعلاً قبل ما نبدأ جديد
+        time.sleep(0.5)
 
-            worker = AccountWorker(
-                email=account['email'],
-                password=account['password'],
-                proxy=proxy,
-                index=proxy_index,
-                account_id=account_id
-            )
+        account = get_account_by_id(account_id)
+        if not account:
+            return False
 
-            if proxy:
-                update_account(account_id, proxy=proxy, proxy_index=proxy_index)
+        proxies = load_proxies()
+        proxy = None
+        proxy_index = 0
 
+        if USE_PROXIES and proxies:
+            base_proxy = proxies[0]
+
+            if SESSION_BASED_PROXY and is_session_proxy(base_proxy):
+                proxy = build_session_proxy(account_id, base_proxy, SESSION_PREFIX)
+                proxy_index = 0
+                logger.info(f"🔀 Session proxy للحساب {account_id}")
+            else:
+                proxy_index = account_id % len(proxies)
+                proxy = proxies[proxy_index]
+                logger.info(f"🌐 Proxy #{proxy_index} للحساب {account_id}")
+
+        worker = AccountWorker(
+            email=account['email'],
+            password=account['password'],
+            proxy=proxy,
+            index=proxy_index,
+            account_id=account_id
+        )
+
+        if proxy:
+            update_account(account_id, proxy=proxy, proxy_index=proxy_index)
+
+        with worker_lock:
             self.workers[account_id] = worker
 
-            thread = threading.Thread(target=worker.run, daemon=True)
-            thread.start()
+        thread = threading.Thread(target=worker.run, daemon=True)
+        thread.start()
+
+        with worker_lock:
             self.threads[account_id] = thread
 
-            return True
+        logger.info(f"✅ تم تشغيل الحساب {account['email']}")
+        return True
 
     def stop_account(self, account_id):
         with worker_lock:
@@ -1603,16 +1623,19 @@ class BotManager:
             worker = self.workers[account_id]
             worker.running = False
             worker.stopped = True
+            worker.stop_event.set()   # ✅ إيقاف فوري
 
             if account_id in self.threads:
                 try:
-                    self.threads[account_id].join(timeout=5)
+                    self.threads[account_id].join(timeout=10)
                 except:
                     pass
                 del self.threads[account_id]
 
             del self.workers[account_id]
-            return True
+
+        logger.info(f"⏹️ تم إيقاف الحساب {account_id}")
+        return True
 
     def start_all(self):
         accounts = get_all_accounts(active_only=True)
@@ -1630,17 +1653,42 @@ class BotManager:
         account_ids = list(self.workers.keys())
         stopped = 0
 
+        # ✅ المرحلة 1: نطلب إيقاف كل الحسابات فوراً
+        with worker_lock:
+            for acc_id in account_ids:
+                if acc_id in self.workers:
+                    worker = self.workers[acc_id]
+                    worker.running = False
+                    worker.stopped = True
+                    worker.stop_event.set()
+
+        # ✅ المرحلة 2: نستنى كل الـ Threads تخلص (بحد أقصى 10 ثواني)
+        logger.info(f"⏳ انتظار {len(account_ids)} Thread للتوقف...")
         for acc_id in account_ids:
-            if self.stop_account(acc_id):
-                stopped += 1
+            with worker_lock:
+                if acc_id in self.threads:
+                    try:
+                        self.threads[acc_id].join(timeout=10)
+                    except:
+                        pass
+
+        # ✅ المرحلة 3: ننضف كل حاجة
+        with worker_lock:
+            for acc_id in account_ids:
+                if acc_id in self.workers:
+                    del self.workers[acc_id]
+                    stopped += 1
+                if acc_id in self.threads:
+                    del self.threads[acc_id]
 
         self.running = False
+        logger.info(f"⏹️ تم إيقاف {stopped} حساب")
         return stopped
 
     def get_status(self):
         accounts = get_all_accounts()
         total = len(accounts)
-        running = len(self.workers)
+        running = 0
 
         total_balance = 0
         total_spins = 0
@@ -1654,11 +1702,14 @@ class BotManager:
             if acc.get('mail_ok', 0):
                 mail_ok_count += 1
 
-            worker = self.workers.get(acc['id'])
+            with worker_lock:
+                worker = self.workers.get(acc['id'])
+
             mail_ok = bool(acc.get('mail_ok', 0))
 
-            if worker and worker.running:
+            if worker and worker.running and not worker.stop_event.is_set():
                 status_icon = "🟢"
+                running += 1
                 current_ip = worker.current_ip
                 balance = worker.balance
                 credits = worker.credits
@@ -1753,7 +1804,7 @@ bot_manager = BotManager()
 
 
 # ============================================================
-# إضافة حساب واحد (بدون سحب)
+# إضافة حساب واحد
 # ============================================================
 async def add_single_account(email, password, progress_msg=None, silent=False,
                              forced_proxy=None, forced_proxy_index=None):
@@ -2097,6 +2148,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_chat_id
+
     bot_chat_id = update.message.chat_id
     bot_manager.chat_id = update.message.chat_id
 
@@ -2693,16 +2746,16 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
 
-    print("🎰 Starting Slot Bot - بدون سحب")
+    print("🎰 Starting Slot Bot - بدون سحب (معدّل)")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ Bot is running! Press Ctrl+C to stop")
     print(f"🌐 وضع البروكسي: {'Session (Bright Data)' if session_mode else 'عادي'}")
     print(f"📊 عدد البروكسيات: {len(proxies)}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ السحب محذوف بالكامل (تلقائي + يدوي)")
-    print("✅ الحسابات تشتغل 24/7 بدون توقف")
-    print("✅ نظام التسجيل شغال عادي")
-    print("✅ لوحة تحكم محسّنة")
+    print("✅ السحب محذوف بالكامل")
+    print("✅ الحسابات تشتغل 24/7")
+    print("✅ إيقاف/تشغيل فوري (stop_event)")
+    print("✅ تنظيف تلقائي للـ Workers القديمة")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     try:
