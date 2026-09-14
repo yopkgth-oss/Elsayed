@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Slot Bot - النسخة النهائية مع نظام Recovery
+Slot Bot - النسخة النهائية المدمجة
+- farm_ads من القديم (شغالة)
+- Recovery system من الجديد
 - بدون سحب
-- mail_monitor مؤقت (بس عند الحاجة)
-- recovery تلقائي (جلسة جديدة / بروكسي جديد / إشعارات)
 """
 
 import os
@@ -49,7 +49,7 @@ def load_config():
         "base_url": "https://slotfruits.com",
         "mail_tm_api": "https://api.mail.tm",
         "mail_tm_domain": "@uberip.com",
-        "timeout": 90,
+        "timeout": 30,
         "use_proxies": True,
         "session_based_proxy": True,
         "session_prefix": "acc",
@@ -66,15 +66,15 @@ def load_config():
             for key, value in default_config.items():
                 if key not in config:
                     config[key] = value
-            print("✅ تم تحميل الإعدادات من config.json")
+            print("✅ تم تحميل الإعدادات")
             return config
         except Exception as e:
-            print(f"❌ خطأ في تحميل config.json: {e}")
+            print(f"❌ خطأ في config.json: {e}")
             return default_config
     else:
         with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, indent=2, ensure_ascii=False)
-        print("✅ تم إنشاء config.json — عدّل التوكن ثم أعد التشغيل")
+        print("✅ تم إنشاء config.json — عدّل التوكن")
         sys.exit(1)
 
 
@@ -82,13 +82,13 @@ CONFIG = load_config()
 
 BOT_TOKEN = CONFIG.get("bot_token")
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-    print("❌ لم يتم تعيين BOT_TOKEN في config.json")
+    print("❌ لم يتم تعيين BOT_TOKEN")
     sys.exit(1)
 
 BASE_URL = CONFIG.get("base_url")
 MAIL_TM_API = CONFIG.get("mail_tm_api")
 MAIL_TM_DOMAIN = CONFIG.get("mail_tm_domain")
-TIMEOUT = CONFIG.get("timeout", 90)
+TO = CONFIG.get("timeout", 30)
 USE_PROXIES = CONFIG.get("use_proxies", True)
 SESSION_BASED_PROXY = CONFIG.get("session_based_proxy", True)
 SESSION_PREFIX = CONFIG.get("session_prefix", "acc")
@@ -98,7 +98,6 @@ NOTIFY_ON_ERROR = CONFIG.get("notify_on_error", True)
 REGISTER_TIMEOUT = CONFIG.get("register_timeout", 90)
 
 API_URL = f"{BASE_URL}/api/v1"
-GRAPHQL_URL = f"{BASE_URL}/graphql"
 
 FAKE_NUMBERS = {
     "2018", "2019", "2020", "2021", "2022", "2023",
@@ -139,7 +138,7 @@ def safe_notify(message):
             main_event_loop
         )
     except Exception as e:
-        logger.error(f"فشل إرسال الإشعار: {e}")
+        logger.error(f"فشل الإشعار: {e}")
 
 
 # ============================================================
@@ -322,7 +321,7 @@ def load_proxies(proxy_file="proxy.txt"):
                         line = f"http://{line}"
                     proxies.append(line)
     except Exception as e:
-        logger.error(f"خطأ في تحميل البروكسيات: {e}")
+        logger.error(f"خطأ تحميل البروكسيات: {e}")
     return proxies
 
 
@@ -334,7 +333,7 @@ def save_proxies(proxies, proxy_file="proxy.txt"):
                 f.write(f"{p}\n")
         return True
     except Exception as e:
-        logger.error(f"خطأ في حفظ البروكسيات: {e}")
+        logger.error(f"خطأ حفظ البروكسيات: {e}")
         return False
 
 
@@ -378,11 +377,11 @@ def build_session_proxy(account_id, base_proxy, session_prefix="acc"):
         ))
         return new_proxy
     except Exception as e:
-        logger.error(f"خطأ في build_session_proxy: {e}")
+        logger.error(f"خطأ build_session_proxy: {e}")
         return base_proxy
 
 
-def get_ip(proxy, timeout=30):
+def get_ip(proxy, timeout=10):
     if not proxy:
         return "بدون بروكسي"
 
@@ -426,7 +425,7 @@ def get_cached_ip(proxy, force_refresh=False):
             cached_time, cached_ip = ip_cache[proxy]
             if (time.time() - cached_time) < max_age:
                 return cached_ip
-    ip = get_ip(proxy, timeout=30)
+    ip = get_ip(proxy, timeout=15)
     with ip_cache_lock:
         ip_cache[proxy] = (time.time(), ip)
     return ip
@@ -443,7 +442,7 @@ def test_proxy_detailed(proxy):
         response = requests.get(
             "https://api.ipify.org?format=json",
             proxies={"http": proxy_clean, "https": proxy_clean},
-            timeout=30
+            timeout=15
         )
         response_time = time.time() - start_time
         if response.status_code == 200:
@@ -660,7 +659,6 @@ def extract_code_filtered(email_data):
 
 
 def start_mail_monitor(email, password):
-    """يبدأ مراقبة مؤقتة — بترجع True لو نجح"""
     with mail_lock:
         if email in mail_monitors and mail_monitors[email].get("running", False):
             return True
@@ -680,7 +678,6 @@ def start_mail_monitor(email, password):
 
     def monitor_loop():
         consecutive_fails = 0
-        # ✅ mail monitor بيشتغل أبطأ عشان الـ rate limit
         poll_interval = 10
         max_fails = 3
 
@@ -696,7 +693,6 @@ def start_mail_monitor(email, password):
                 if messages is None:
                     consecutive_fails += 1
                     if consecutive_fails >= max_fails:
-                        # نحاول نجيب توكن جديد
                         with mail_lock:
                             if email in mail_monitors:
                                 success, new_token = ensure_mail_account(
@@ -706,8 +702,7 @@ def start_mail_monitor(email, password):
                                     mail_monitors[email]["token"] = new_token
                                     consecutive_fails = 0
                                     continue
-                        # لو فشل — نوقف بالكامل
-                        logger.warning(f"⏹️ إيقاف mail monitor لـ {email} (فشل متكرر)")
+                        logger.warning(f"⏹️ إيقاف mail monitor لـ {email}")
                         with mail_lock:
                             if email in mail_monitors:
                                 mail_monitors[email]["running"] = False
@@ -751,16 +746,14 @@ def start_mail_monitor(email, password):
                                     })
                                     if len(registration_codes[email]) > 3:
                                         registration_codes[email] = registration_codes[email][-3:]
-                                logger.info(f"✅ كود تحقق مخزن: {code_reg}")
+                                logger.info(f"✅ كود مخزن: {code_reg}")
 
                 time.sleep(poll_interval)
 
             except Exception as e:
-                logger.debug(f"mail_monitor خطأ لـ {email}: {str(e)[:80]}")
+                logger.debug(f"mail_monitor خطأ {email}: {str(e)[:80]}")
                 consecutive_fails += 1
                 time.sleep(poll_interval)
-
-        logger.info(f"⏹️ mail monitor توقف لـ {email}")
 
     thread = threading.Thread(target=monitor_loop, daemon=True, name=f"mail-{email[:10]}")
     thread.start()
@@ -769,19 +762,15 @@ def start_mail_monitor(email, password):
 
 
 def stop_mail_monitor(email):
-    """إيقاف mail monitor لحساب معين"""
     with mail_lock:
         if email in mail_monitors:
             mail_monitors[email]["running"] = False
-            logger.info(f"⏹️ إيقاف mail monitor لـ {email}")
 
 
 def wait_for_code_registration(email, password, timeout=None):
-    """انتظر كود التحقق — للاستخدام المؤقت بس"""
     if timeout is None:
         timeout = REGISTER_TIMEOUT
 
-    # نتأكد إن monitor شغال
     if email not in mail_monitors or not mail_monitors[email].get("running", False):
         if not start_mail_monitor(email, password):
             return None
@@ -797,87 +786,31 @@ def wait_for_code_registration(email, password, timeout=None):
                         registration_codes[email].pop(i)
                         return code
 
-        time.sleep(3)
+        time.sleep(2)
 
     return None
-    # ============================================================
-# SlotFruits API — مع smart_request
+
+
 # ============================================================
-def smart_request(method, url, token=None, proxy=None, max_retries=3, **kw):
-    """
-    ترجع: (response, error_type)
-    error_type: None | 'auth' | 'rate_limit' | 'server' | 'network' | 'timeout' | 'client' | 'max_retries'
-    """
-    kw.setdefault("timeout", 25)
-    if proxy:
-        proxy_clean = proxy.strip()
-        if not proxy_clean.startswith("http://") and not proxy_clean.startswith("https://"):
-            proxy_clean = f"http://{proxy_clean}"
-        kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
-
-    for attempt in range(max_retries):
-        try:
-            res = requests.request(method, url, **kw)
-
-            # ✅ نجاح
-            if 200 <= res.status_code < 300:
-                return res, None
-
-            # 🔑 401/403 → التوكن انتهى
-            if res.status_code in (401, 403):
-                return res, 'auth'
-
-            # ⏸️ 429 → rate limit
-            if res.status_code == 429:
-                wait = min(60, (2 ** attempt) * 5)
-                logger.warning(f"⏸️ Rate limit — استنى {wait}s")
-                time.sleep(wait)
-                continue
-
-            # 🖥️ 5xx → مشكلة سيرفر
-            if res.status_code >= 500:
-                wait = 2 ** attempt
-                logger.warning(f"🖥️ سيرفر {res.status_code} — استنى {wait}s")
-                time.sleep(wait)
-                continue
-
-            # 4xx تانية
-            return res, 'client'
-
-        except requests.exceptions.Timeout:
-            logger.warning(f"⏱️ Timeout (محاولة {attempt+1}/{max_retries})")
-            time.sleep(2 ** attempt)
-
-        except requests.exceptions.ProxyError:
-            logger.warning(f"🌐 Proxy error (محاولة {attempt+1}/{max_retries})")
-            return None, 'network'
-
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"🔌 Connection error (محاولة {attempt+1}/{max_retries})")
-            time.sleep(2)
-
-        except Exception as e:
-            logger.error(f"❌ خطأ غير متوقع: {str(e)[:100]}")
-            time.sleep(1)
-
-    return None, 'max_retries'
-
-
+# SlotFruits API — safe_request البسيط (زي القديم)
+# ============================================================
 def safe_request(method, url, **kw):
-    """نسخة مبسطة للاستخدام العام"""
-    res, _ = smart_request(method, url, max_retries=2, **kw)
-    return res
+    """الطلب البسيط — 3 محاولات بدون تعقيد"""
+    kw.setdefault("timeout", TO)
+    for attempt in range(3):
+        try:
+            response = requests.request(method, url, **kw)
+            if response.status_code < 500:
+                return response
+            time.sleep(1)
+        except Exception as e:
+            logger.debug(f"Request attempt {attempt+1} failed: {e}")
+            time.sleep(0.5)
+    return None
 
 
 def do_register(email, password, proxy=None):
     try:
-        token = get_mail_token(email, password)
-        if not token:
-            email, password, success = create_mail_account(email, password)
-            if not success:
-                return False, "فشل إنشاء البريد المؤقت"
-
-        time.sleep(1)
         url = f"{API_URL}/users/registerFaucetPay"
         payload = {"email": email, "password": password}
         headers = {
@@ -885,17 +818,18 @@ def do_register(email, password, proxy=None):
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
         }
-        res, error = smart_request("POST", url, proxy=proxy,
-                                   headers=headers, data=json.dumps(payload),
-                                   max_retries=2)
+        kw = {"headers": headers, "data": json.dumps(payload)}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        res = safe_request("POST", url, **kw)
         if not res:
-            return False, f"لا يوجد استجابة ({error})"
+            return False, "لا يوجد استجابة"
 
-        try:
-            data = res.json()
-        except:
-            return False, f"رد غير صالح: {res.text[:100]}"
-
+        data = res.json()
         if data.get("success") or data.get("needsConfirmation") == True:
             return True, "تم التسجيل"
         return False, data.get("message", "فشل التسجيل")
@@ -912,20 +846,21 @@ def do_login(email, password, proxy=None):
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
         }
-        res, error = smart_request("POST", url, proxy=proxy,
-                                   headers=headers, data=json.dumps(payload),
-                                   max_retries=2)
+        kw = {"headers": headers, "data": json.dumps(payload)}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        res = safe_request("POST", url, **kw)
         if not res:
-            return None, None, 0, 0, f"لا يوجد استجابة ({error})"
+            return None, None, 0, 0, "لا يوجد استجابة"
 
-        try:
-            data = res.json()
-        except:
-            return None, None, 0, 0, f"رد غير صالح: {res.text[:100]}"
-
+        data = res.json()
         user = data.get("user")
         if not user:
-            return None, None, 0, 0, data.get("msg", "فشل تسجيل الدخول")
+            return None, None, 0, 0, "فشل تسجيل الدخول"
 
         return (data.get("token"), user.get("_id"),
                 user.get("balance", 0), user.get("credits", 0), "نجاح")
@@ -942,11 +877,16 @@ def check_account_exists_in_slotfruits(email, password, proxy=None):
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
         }
-        res, error = smart_request("POST", url, proxy=proxy,
-                                   headers=headers, data=json.dumps(payload),
-                                   max_retries=2)
+        kw = {"headers": headers, "data": json.dumps(payload)}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        res = safe_request("POST", url, **kw)
         if not res:
-            return {"exists": False, "error": f"البروكسي مش شغال ({error})"}
+            return {"exists": False, "error": "البروكسي مش شغال"}
 
         try:
             data = res.json()
@@ -992,18 +932,19 @@ def do_confirm(email, code, proxy=None):
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
         }
-        res, error = smart_request("POST", url, proxy=proxy,
-                                   headers=headers, data=json.dumps(payload),
-                                   max_retries=2)
+        kw = {"headers": headers, "data": json.dumps(payload)}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        res = safe_request("POST", url, **kw)
         if not res:
-            return False, None, f"لا يوجد استجابة ({error})"
+            return False, None, "لا يوجد استجابة"
 
-        try:
-            data = res.json()
-        except:
-            return False, None, "رد غير صالح"
-
-        if data.get("token") or data.get("success"):
+        data = res.json()
+        if data.get("token") or data.get("user") or data.get("success"):
             return True, data.get("token"), "تم التأكيد"
         return False, None, data.get("message", "فشل التأكيد")
     except Exception as e:
@@ -1017,129 +958,122 @@ def get_user_info(token, proxy=None):
             "Accept": "application/json, text/plain, */*",
             "Authorization": f"Bearer {token}"
         }
-        res, error = smart_request("GET", f"{API_URL}/users/me", token=token,
-                                   proxy=proxy, headers=headers, max_retries=2)
+        kw = {"headers": headers}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        res = safe_request("GET", f"{API_URL}/users/me", **kw)
         if res and res.status_code == 200:
-            try:
-                return res.json().get("user", {})
-            except:
-                return None
+            return res.json().get("user", {})
         return None
     except:
         return None
 
 
-def farm_ads(user_id, proxy=None):
+# ============================================================
+# spin_once — من القديم (lowercase authorization + gzip)
+# ============================================================
+def spin_once(token, proxy=None):
+    try:
+        headers = {
+            "User-Agent": "okhttp/4.12.0",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip",
+            "authorization": f"Bearer {token}",   # ✅ lowercase زي القديم
+        }
+        kw = {"headers": headers}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+
+        r = safe_request("GET", f"{API_URL}/users/earnRoll", **kw)
+        if not r or r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+    except:
+        return None
+
+
+# ============================================================
+# farm_ads — من القديم (headers كاملة)
+# ============================================================
+def farm_ads(userid, proxy=None):
     FARM_ADS_URL = (
         "https://googleads.g.doubleclick.net/mads/gma?submodel=SM-A217F&adid_p=1&format=interstitial_mb"
         "&ini_pn=com.google.android.packageinstaller&ins_pn=com.google.android.packageinstaller"
         "&omid_v=a.1.5.2-google_20241009&dv=254380203&ev=24.6.0&gl=ID&hl=in"
         "&js=afma-sdk-a-v254380999.253410000.1&kw=clothing%2Cfashion&lv=253410000"
-        "&ms=CqgFmsA_ATEaQQHY5dWIJ1nnZI0TXJOCrRjxy3oie3ZsfYBDue5jJF2CTFQQuf7W9C9KnP8xbLx0FI_PC-5wIrw0itcrK2KvDP4iEt0E6Yp1pn72NO8vWhbzh19JnXz5v7gGWsohjScUvkVohNO_jbecHUPYSmqy4T-WuJZ2EFv8_r-2HeMQg4ZPiq_jwKyeOrQjsiRXsU8vcZpKSMI0Z7Pn6iha94ABhZW_FbLysDgYt2ox4f_FIffLSbr_vjYntwKQpTg44MpacMRJ2_Ch0aplBuEzXYGkOTHBpg58oZtEw_3nZ8wsO9jE5lLVvx_cmKmOEpfemdesE_wTXvV0Hv5MWrZQ2I4ulXfQrY_gKRBI5ivJJLh3XYIzgBBRhoZastP7yEVFBT7Y8iunIsK3VrABvtw9RWUDkE2lETA0ezNEzwFoAhoGTGHuS2JaZ68x68KZGPFPR1CX4CXbMf1DDtzECiUr12lOsiuPUQ2WWtrjma3PKtkBk-0B5HoTVviRRPOHqgth3x80sbtwMn4G95El7JP079-e_jUT0oa75oJQC-Ph3zmllppvqq3dJN_RCGbyELdXc042fsR1fi3Syd6w1SJROO_t2sP3o2Bdzn2_jv1aokWO8NAzbtrWUs64BUiv1-XMv3k6CReZ91Ac9T28vbfulD8b_t8WSPrIHmXCGEC4h50U74SHhRxUcOmlR7sWpB2y8WfC7NlfoGCG5r6vXzVpG1oFOvTYscbEq1GPl1SjpnwS00RVM5_wfwa6GKc53oRubkV-CBhU_KMXUN115FELhAaNab2qn8reOKeN6xdg_OkZjGgHml1GIlVQity3LvBcbzP2yE898LCwcwXVc9oLcH_WHL1eb7K19Zf6kpquk35qGtTP3xrSzDcw6t-GAxGg1lTCxlMgBA"
+        "&ms=CqgFmsA_ATEaQQHY5dWIJ1nnZI0TXJOCrRjxy3oie3ZsfYBDue5jJF2CTFQQuf7W9C9KnP8xbLx0FI_PC-5wIrw0itcrK2KvDP4iEt0E6Yp1pn72NO8vWhbzh19JnXz5v7gGWsohjScUvkVohNO_jbecHUPYSmqy4T-WuJZ2EFv8_r-2HeMQg4ZPiq_jwKyeOrQjsiRXsU8vcZpKSMI0Z7Pn6iha94ABhZW_FbLysDgYt2ox4f_FIffLSbr_vjYntwKQpTg44MpacMRJ2_Ch0aplBuEzXYGkOTHBpg58oZtEw_3nZ8wsO9jE5lLVvx_cmKmOEpfemdesE_wTXvV0Hv5MWrZQ2I4ulXfQrY_gKRBI5ivJJLh3XYIzgBBRhoZastP7yEVFBT7Y8iunIsK3VrABvtw9RWUDkE2lETA0ezNEzwFoAhoGTGHuS2JaZ68x68KZGPFPR1CX4CXbMf1DDtzECiUr12lOsiuPUQ2WWtrjma3PKtkBk-0B5HoTVviRRPOHqgth3x80sbtwMn4G95El7JP079-e_jUT0oa75oJQC-Ph3zmllppvqq3dJN_RCGbyELdXc042fsR1fi3Syd6w1SJROO_t2sP3o2Bdzn2_jv1aokWO8NAzbtrWUs64BUiv1-XMv3k6CReZ91Ac9T28vbfulD8b_t8WSPrIHmXCGEC4h50U74SHhRxUcOmlR7sWpB2y8WfC7NlfoGCG5r6vXzVpG1oFOvTYscbEq1GPl1SjpnwS00RVM5_wfwa6GKc53oRubkV-CBhU_KMXUN115FELhAaNab2qn8reOKeN6xdg_OkZjGgHml1GIlVQity3vBcbzP2yE898LCwcwXVc9oLcH_WHL1eb7K19Zf6kpquk35qGtTP3xrSzDcw6t-GAxGg1lTCxlMgBA"
         "&mv=84923430.com.android.vending&lft=1&vnm=1.1.6&plbs=0&plcs=0&u_sd=1.75&request_id=1267448703"
         "&target_api=35&carrier=51011&request_agent=rn-invertase-15.8.0&seq_num=2"
+        "&eid=318500618,318486317,318491267,318503826,318509511,318509849,318515546,318518927,318527162"
         "&sdk_apis=7%2C8&omid_p=Google%2Fafma-sdk-a-v260480999.253410000.1&cap=m&u_w=412&u_h=828"
         "&msid=com.piratebaixe.slotMobile&an=17.android.com.spincoin.appmobile.top&u_audio=3&net=ed&u_so=p"
-        "&rbv=1&preqs_in_session=1&preqs=1&time_in_session=70&pcc=0"
+        "&rbv=1&loeid=44766145%2C318502926&preqs_in_session=1&preqs=1&time_in_session=70&pcc=0"
         "&sst=1766181420000&output=html&region=mobile_app&u_tz=420&client=ca-app-pub-5674874137587223"
         "&slotname=7114498212&kw_type=broad&gsb=4g&lite=0&app_wp_code=ca-app-pub-5674874137587223"
         "&app_code=5186053460&num_ads=1&vpt=8&vfmt=18&vst=0&sdkv=o.254380999.253410000.1&sdmax=0&dmax=1"
         "&sdki=3c4d&stbg=1&bisch=true&blev=0.16&canm=true&_mv=84923430.com.android.vending"
         "&heap_free=35837248&heap_max=268435456&heap_total=67108864&wv_count=0&rdps=5500"
+        "&caps=inlineVideo_interactiveVideo_mraid1_mraid2_mraid3_sdkVideo_exo3_th_autoplay_mediation_scroll_av_transparentBackground_sdkAdmobApiForAds_di_aso_sfv_dinm_dim_nav_navc_dinmo_ipdof_gls_gcache_saiMacro_sai_demuxedGcache_xSeconds"
         "&is_lat=false&blob=ABPQqLFPLHz2k6c8n6CqX1sW26j7BjCjFG5-MaUl0CxgLB41Sc1B8kpJWaikL2C_Gp9pl25Xd46LPjDMkuzcNeNk1dvygLdxMwK-Y6rlwJbBvC5njmNuysN-8h288vPObPEuoucf6F2FyhorQbQv9YbRKuFGXNMnm3mLs9x1FneK3ofa6gCK_UTEhPBLeTogM4C8tHMwO2a7T816OsKSD0JYRvo61pYUj8Rx-RsJMnAhHhTzRs3ktQdg-BbwRWiEaPEswxrDeM_GpknK8GoDLzwQ_wuTxQDlAIhl0WIPz9VciYotTXJ86Pe3mMuMwqNeQhZ_qFNQWL_Rncwnb9idfxUEGM5ucxxK_zjofg8F"
     )
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-A217F) AppleWebKit/537.36",
-        "sec-ch-ua-platform": "Android",
+    # ✅ headers كاملة زي القديم
+    FARM_ADS_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 12; SM-A217F Build/SP1A.210812.016; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/147.0.7727.111 "
+            "Mobile Safari/537.36 (Mobile; afma-sdk-a-v260480999.253410000.1)"
+        ),
+        "sec-ch-ua-platform": '"Android"',
+        "sec-ch-ua": '"Android WebView";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+        "sec-ch-ua-mobile": "?1",
         "x-requested-with": "com.piratebaixe.slotMobile",
     }
 
-    try:
-        res, error = smart_request("GET", FARM_ADS_URL, proxy=proxy,
-                                   headers=headers, max_retries=2)
-        if not res:
-            return False
+    hit = False
+    for _ in range(1):
+        kw = {"headers": FARM_ADS_HEADERS}
+        if proxy:
+            proxy_clean = proxy.strip()
+            if not proxy_clean.startswith("http://"):
+                proxy_clean = f"http://{proxy_clean}"
+            kw["proxies"] = {"http": proxy_clean, "https": proxy_clean}
 
+        resp = safe_request("GET", FARM_ADS_URL, **kw)
+        if not resp:
+            continue
         try:
-            nets = res.json().get("ad_networks", [])
-        except:
-            return False
-
-        for net in nets:
-            for vid in net.get("video_reward_urls", []):
-                p = urlparse(vid)
-                qs = parse_qs(p.query, keep_blank_values=True)
-                qs["rwd_userid"] = [str(user_id)]
-                new = p._replace(query=urlencode(qs, doseq=True))
-                smart_request("GET", urlunparse(new), proxy=proxy,
-                              headers=headers, max_retries=1)
-        return True
-    except:
-        return False
-
-
-def execute_initial_sequence(token, user_id, proxy=None):
-    try:
-        okhttp_headers = {
-            "User-Agent": "okhttp/4.12.0",
-            "Accept": "application/json, text/plain, */*",
-            "Authorization": f"Bearer {token}"
-        }
-
-        smart_request("GET", f"{API_URL}/users/getClick", token=token,
-                      proxy=proxy, headers=okhttp_headers, max_retries=1)
+            nets = resp.json().get("ad_networks", [])
+            for net in nets:
+                for vid in net.get("video_reward_urls", []):
+                    p = urlparse(vid)
+                    qs = parse_qs(p.query, keep_blank_values=True)
+                    qs["rwd_userid"] = [str(userid)]
+                    new = p._replace(query=urlencode(qs, doseq=True))
+                    kw2 = {"headers": FARM_ADS_HEADERS}
+                    if proxy:
+                        proxy_clean = proxy.strip()
+                        if not proxy_clean.startswith("http://"):
+                            proxy_clean = f"http://{proxy_clean}"
+                        kw2["proxies"] = {"http": proxy_clean, "https": proxy_clean}
+                    safe_request("GET", urlunparse(new), **kw2)
+                    hit = True
+        except Exception:
+            pass
         time.sleep(0.3)
-        smart_request("GET", f"{API_URL}/checkVersion", token=token,
-                      proxy=proxy, headers=okhttp_headers, max_retries=1)
-        time.sleep(0.3)
-        smart_request("GET", f"{API_URL}/users/getTimeClick", token=token,
-                      proxy=proxy, headers=okhttp_headers, max_retries=1)
-        time.sleep(0.3)
-
-        if user_id:
-            smart_request("GET", f"{BASE_URL}/mobile/{user_id}",
-                          headers={"User-Agent": "okhttp/4.12.0"},
-                          proxy=proxy, max_retries=1)
-            time.sleep(0.3)
-
-        smart_request("GET", f"{BASE_URL}/dashboard",
-                      headers={"User-Agent": "okhttp/4.12.0",
-                               "Authorization": f"Bearer {token}"},
-                      proxy=proxy, max_retries=1)
-        time.sleep(0.3)
-
-        gql_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "okhttp/4.12.0"
-        }
-
-        user_query = {
-            "operationName": "getUser",
-            "variables": {},
-            "query": "query getUser {\n  getUser {\n    id\n    balance\n    credits\n    username\n    email\n    admin\n    status\n    createAt\n    log\n    xp\n    level\n    next_level\n    bonus_level\n    address_fp\n    bonus_loyalty\n    total_earn\n    ref\n    statistics_earn {\n      id\n      clicks\n      total\n      typename\n    }\n    typename\n  }\n}"
-        }
-        smart_request("POST", GRAPHQL_URL, token=token, proxy=proxy,
-                      headers=gql_headers, json=user_query, max_retries=1)
-        time.sleep(0.3)
-
-        spin_query = {
-            "operationName": "getSpin",
-            "variables": {},
-            "query": "query getSpin {\n  getSpin {\n    spinOne\n    spinTwo\n    __typename\n  }\n}"
-        }
-        smart_request("POST", GRAPHQL_URL, token=token, proxy=proxy,
-                      headers=gql_headers, json=spin_query, max_retries=1)
-
-        return True
-    except Exception as e:
-        logger.error(f"خطأ في execute_initial_sequence: {e}")
-        return False
-
-
-# ============================================================
-# AccountWorker — مع نظام Recovery
+    return hit
+    # ============================================================
+# AccountWorker — مع Recovery + farm_ads القديمة
 # ============================================================
 class AccountWorker:
     def __init__(self, email, password, proxy=None, index=0, account_id=None):
@@ -1157,7 +1091,7 @@ class AccountWorker:
         self.total_earned = 0
         self.spin_count = 0
         self.fail_count = 0
-        self.consecutive_errors = 0
+        self.max_fails = 5
 
         self.running = False
         self.stopped = False
@@ -1208,7 +1142,6 @@ class AccountWorker:
             logger.error(f"❌ {self.email}: لا يوجد بروكسي!")
 
     def change_proxy(self):
-        """تجديد البروكسي — للـ session proxies بيغير session ID"""
         if not USE_PROXIES:
             return False
 
@@ -1240,14 +1173,14 @@ class AccountWorker:
             self.current_ip = "بدون بروكسي"
             return
 
-        self.current_ip = get_ip(self.proxy, timeout=30)
+        self.current_ip = get_ip(self.proxy, timeout=15)
 
         retry = 0
         while self.current_ip == "Unknown" and retry < 5:
-            if self.stop_event.wait(3):
+            if self.stop_event.wait(2):
                 return
             if self.change_proxy():
-                self.current_ip = get_ip(self.proxy, timeout=30)
+                self.current_ip = get_ip(self.proxy, timeout=15)
             retry += 1
 
         if self.current_ip == "Unknown":
@@ -1275,39 +1208,33 @@ class AccountWorker:
         """محاولة تسجيل جديدة بعد ما التوكن فشل"""
         logger.info(f"🆕 محاولة تسجيل {self.email}")
 
-        # نتأكد من البريد
         mail_ok, _ = ensure_mail_account(self.email, self.password)
         if not mail_ok:
             logger.warning(f"⚠️ البريد مش شغال لـ {self.email}")
             return False
 
-        # نشغل mail monitor
         if not start_mail_monitor(self.email, self.password):
             logger.warning(f"⚠️ mail monitor فشل لـ {self.email}")
             return False
 
-        # نسجل
         success, msg = do_register(self.email, self.password, self.proxy)
         if not success:
             logger.warning(f"⚠️ فشل التسجيل: {msg}")
             stop_mail_monitor(self.email)
             return False
 
-        # ننتظر الكود
         code = wait_for_code_registration(self.email, self.password, timeout=REGISTER_TIMEOUT)
         if not code:
             logger.warning(f"⏰ مفيش كود لـ {self.email}")
             stop_mail_monitor(self.email)
             return False
 
-        # نأكد
         success, token, msg = do_confirm(self.email, code, self.proxy)
         if not success:
             logger.warning(f"⚠️ فشل التأكيد: {msg}")
             stop_mail_monitor(self.email)
             return False
 
-        # نحفظ
         user_info = get_user_info(token, self.proxy)
         if user_info:
             self._save_session(
@@ -1319,11 +1246,7 @@ class AccountWorker:
             if self.account_id:
                 update_account(self.account_id, mail_ok=1)
 
-            execute_initial_sequence(token, user_info.get("_id"), self.proxy)
-
-            # ✅ نوقف mail monitor
             stop_mail_monitor(self.email)
-
             logger.info(f"✅ تم تسجيل {self.email}")
             return True
 
@@ -1333,7 +1256,7 @@ class AccountWorker:
     def login(self, skip_register=False):
         """
         skip_register=True → مايحاولش تسجيل (للحسابات المؤكدة)
-        skip_register=False → يحاول تسجيل لو فشل (افتراضي)
+        skip_register=False → يحاول تسجيل لو فشل
         """
         for attempt in range(3):
             if self.stop_event.is_set():
@@ -1346,33 +1269,29 @@ class AccountWorker:
 
                 if token:
                     self._save_session(token, user_id, balance, credits)
-                    execute_initial_sequence(token, user_id, self.proxy)
                     logger.info(f"✅ login: {self.email}")
                     return True
 
                 logger.warning(f"⚠️ login محاولة {attempt+1}/3 لـ {self.email}: {msg}")
 
-                # لو مش عايز تسجيل
                 if skip_register:
-                    time.sleep(3)
+                    time.sleep(2)
                     continue
 
-                # حاول تسجيل (مرة واحدة بس)
                 if attempt == 0:
                     if self._try_register():
                         return True
 
-                # غير بروكسي
                 if USE_PROXIES and attempt < 2:
                     self.change_proxy()
 
-                if self.stop_event.wait(3):
+                if self.stop_event.wait(2):
                     return False
 
             except Exception as e:
                 self.last_error = str(e)[:100]
                 logger.error(f"❌ login exception {self.email}: {e}")
-                if self.stop_event.wait(3):
+                if self.stop_event.wait(2):
                     return False
 
         if self.account_id:
@@ -1382,67 +1301,33 @@ class AccountWorker:
     def _do_spin(self):
         """ترجع (result, error_type)"""
         try:
-            headers = {
-                "User-Agent": "okhttp/4.12.0",
-                "Accept": "application/json, text/plain, */*",
-                "Authorization": f"Bearer {self.token}",
-            }
-
-            res, error = smart_request(
-                "GET", f"{API_URL}/users/earnRoll",
-                token=self.token,
-                proxy=self.proxy,
-                headers=headers,
-                max_retries=2
-            )
-
-            if error:
-                return None, error
-
-            if not res:
-                return None, 'network'
-
-            if res.status_code != 200:
-                return None, 'server'
-
-            try:
-                data = res.json()
-            except:
-                return None, 'server'
-
-            return data, None
-
-        except Exception as e:
-            logger.error(f"❌ _do_spin: {e}")
-            return None, 'unknown'
-
-    def farm_and_wait(self):
-        """يجيب credits من farm_ads"""
-        try:
-            if self.user_id:
+            if self.credits <= 0:
+                # ⚡ نستخدم farm_ads القديمة
                 farm_ads(self.user_id, self.proxy)
-                time.sleep(random.uniform(1.5, 3.0))
+                # ✅ انتظار قصير زي القديم (0.5s)
+                time.sleep(0.5)
 
                 user_info = get_user_info(self.token, self.proxy)
                 if user_info:
                     self.credits = user_info.get('credits', 0)
                     self.balance = user_info.get('balance', self.balance)
-                    return True
+
+            if self.credits <= 0:
+                return None, 'no_credits'
+
+            data = spin_once(self.token, self.proxy)
+
+            if data:
+                return data, None
+
+            return None, 'server'
+
         except Exception as e:
-            logger.error(f"❌ farm_and_wait: {e}")
-        return False
+            logger.error(f"❌ _do_spin: {e}")
+            return None, 'unknown'
 
     def spin(self):
         try:
-            # لو credits = 0 → farm_ads
-            if self.credits <= 0:
-                self.farm_and_wait()
-
-            if self.credits <= 0:
-                # لسه 0 → نعتبره خطأ عادي ونكمل
-                self.fail_count += 1
-                return None
-
             data, error = self._do_spin()
 
             if data:
@@ -1472,22 +1357,21 @@ class AccountWorker:
                 self.fail_count = 0
                 return data
 
-            # ❌ فشل — نصنف الخطأ
+            # ❌ فشل
             if error == 'auth':
-                logger.warning(f"🔑 التوكن انتهى لـ {self.email} — جلسة جديدة")
+                logger.warning(f"🔑 التوكن انتهى لـ {self.email}")
                 if self.login(skip_register=False):
                     return self.spin()
 
             elif error == 'network':
-                logger.warning(f"🌐 مشكلة نت لـ {self.email} — غير بروكسي")
+                logger.warning(f"🌐 مشكلة نت لـ {self.email}")
                 if self.change_proxy():
                     if self.login(skip_register=True):
                         return self.spin()
 
-            elif error == 'rate_limit':
-                logger.warning(f"⏸️ Rate limit — استنى 30s")
-                if self.stop_event.wait(30):
-                    return None
+            elif error == 'no_credits':
+                # مش خطأ حقيقي — محاولة تانية بعد وقت قصير
+                pass
 
             self.fail_count += 1
             return None
@@ -1507,71 +1391,74 @@ class AccountWorker:
             self.running = False
             return
 
-        # محاولة تسجيل دخول أولى — مع التسجيل لو التوكن فشل
         if not self.login(skip_register=False):
-            logger.error(f"❌ {self.email}: فشل login — الحساب هيتوقف")
+            logger.error(f"❌ {self.email}: فشل login")
             if self.account_id:
                 update_account(self.account_id, is_active=0)
             self.running = False
             return
 
         consecutive_errors = 0
-        last_spin_time = time.time()
 
         while self.running and not is_shutting_down and not self.stop_event.is_set():
             try:
-                result = self.spin()
+                # ✅ 10 سبنات في الحلقة (زي القديم)
+                for spin_num in range(1, 11):
+                    if not self.running or is_shutting_down or self.stop_event.is_set():
+                        return
 
-                if result is None:
-                    consecutive_errors += 1
-                    self.last_error = f"فشل #{consecutive_errors}"
+                    result = self.spin()
 
-                    # ⚠️ 3 أخطاء → جلسة جديدة
-                    if consecutive_errors == 3:
-                        logger.warning(f"🔄 3 أخطاء — جلسة جديدة لـ {self.email}")
-                        if self.login(skip_register=True):
-                            consecutive_errors = 0
+                    if result is None:
+                        consecutive_errors += 1
+                        self.last_error = f"فشل #{consecutive_errors}"
 
-                    # ⚠️ 6 أخطاء → بروكسي جديد + جلسة
-                    elif consecutive_errors == 6:
-                        logger.warning(f"🔄 6 أخطاء — بروكسي جديد لـ {self.email}")
-                        self.change_proxy()
-                        if self.login(skip_register=True):
-                            consecutive_errors = 0
+                        # ⚠️ 5 أخطاء → جلسة جديدة
+                        if consecutive_errors == 5:
+                            logger.warning(f"🔄 5 أخطاء — جلسة جديدة لـ {self.email}")
+                            if self.login(skip_register=True):
+                                consecutive_errors = 0
 
-                    # ⚠️ 10 أخطاء → استنى 10 دقايق
-                    elif consecutive_errors >= 10:
-                        logger.error(f"💤 10 أخطاء — استنى 10 دقايق لـ {self.email}")
-                        safe_notify(
-                            f"⚠️ <b>الحساب واجه مشاكل</b>\n"
-                            f"📧 {self.email}\n"
-                            f"⏸️ استنى 10 دقايق ثم يعيد المحاولة"
-                        )
+                        # ⚠️ 10 أخطاء → بروكسي جديد + جلسة
+                        elif consecutive_errors == 10:
+                            logger.warning(f"🔄 10 أخطاء — بروكسي جديد لـ {self.email}")
+                            self.change_proxy()
+                            if self.login(skip_register=True):
+                                consecutive_errors = 0
 
-                        if self.stop_event.wait(600):
-                            return
-
-                        self.change_proxy()
-                        if self.login(skip_register=True):
-                            consecutive_errors = 0
-                        else:
-                            logger.error(f"❌ {self.email}: فشل recovery — إيقاف")
+                        # ⚠️ 20 خطأ → استنى 10 دقايق
+                        elif consecutive_errors >= 20:
+                            logger.error(f"💤 20 خطأ — استنى 10 دقايق لـ {self.email}")
                             safe_notify(
-                                f"❌ <b>الحساب اتوقف</b>\n"
+                                f"⚠️ <b>الحساب واجه مشاكل</b>\n"
                                 f"📧 {self.email}\n"
-                                f"⚠️ فشل كل محاولات الاستعادة"
+                                f"⏸️ استنى 10 دقايق"
                             )
-                            self.running = False
-                            if self.account_id:
-                                update_account(self.account_id, is_active=0)
-                            return
 
-                else:
-                    # ✅ نجح
-                    consecutive_errors = 0
-                    last_spin_time = time.time()
+                            if self.stop_event.wait(600):
+                                return
 
-                # تحديث DB كل ما نخلص سبن
+                            self.change_proxy()
+                            if self.login(skip_register=True):
+                                consecutive_errors = 0
+                            else:
+                                logger.error(f"❌ {self.email}: فشل recovery")
+                                safe_notify(
+                                    f"❌ <b>الحساب اتوقف</b>\n"
+                                    f"📧 {self.email}"
+                                )
+                                self.running = False
+                                if self.account_id:
+                                    update_account(self.account_id, is_active=0)
+                                return
+                    else:
+                        consecutive_errors = 0
+
+                    # ✅ انتظار قصير زي القديم (0.3-0.7s)
+                    if self.stop_event.wait(random.uniform(0.3, 0.7)):
+                        return
+
+                # تحديث DB بعد كل 10 سبنات
                 if self.account_id:
                     try:
                         update_account(
@@ -1583,14 +1470,13 @@ class AccountWorker:
                     except:
                         pass
 
-                # انتظار عادي بين السبنات
-                wait_time = random.uniform(3.0, 8.0)
-                if self.stop_event.wait(wait_time):
+                # ✅ انتظار قصير بين الدورات (زي القديم)
+                if self.stop_event.wait(random.uniform(2.0, 5.0)):
                     return
 
             except Exception as e:
                 logger.error(f"❌ خطأ في حلقة {self.email}: {e}")
-                if self.stop_event.wait(10):
+                if self.stop_event.wait(5):
                     return
 
         self.running = False
@@ -1608,16 +1494,15 @@ class BotManager:
         self.chat_id = None
         self.dashboard_page = 0
         self.delete_page = 0
+        self.start_time = datetime.now()
 
     def start_account(self, account_id):
         with worker_lock:
-            # لو فيه worker قديم
             if account_id in self.workers:
                 old = self.workers[account_id]
                 if old.running and not old.stop_event.is_set():
                     logger.warning(f"⚠️ {account_id} شغال بالفعل")
                     return False
-                # نظفه
                 old.running = False
                 old.stop_event.set()
                 if account_id in self.threads:
@@ -1762,6 +1647,8 @@ class BotManager:
 
         avg_balance = int(total_balance / total) if total > 0 else 0
 
+        uptime = str(datetime.now() - self.start_time).split('.')[0]
+
         return {
             'total_accounts': total,
             'running_accounts': running,
@@ -1769,6 +1656,7 @@ class BotManager:
             'total_spins': total_spins,
             'mail_ok_count': mail_ok_count,
             'avg_balance': avg_balance,
+            'uptime': uptime,
             'details': details
         }
 
@@ -1792,6 +1680,7 @@ class BotManager:
         text = (
             f"📊 <b>لوحة التحكم</b> — صفحة {page+1}/{total_pages}\n"
             f"━━━━━━━━━━━━━━━━━\n"
+            f"⏱️ وقت التشغيل: {status['uptime']}\n"
             f"📧 إجمالي: <b>{total_accounts}</b>  |  "
             f"🟢 نشط: <b>{status['running_accounts']}</b>  |  "
             f"🔴 متوقف: <b>{stopped_count}</b>\n"
@@ -1975,7 +1864,6 @@ async def add_single_account(email, password, progress_msg=None, silent=False,
                     proxy, proxy_index, mail_ok=1, account_type='confirmed'
                 )
 
-            # ✅ نوقف mail monitor بعد التأكيد
             stop_mail_monitor(email)
 
             if account_id:
@@ -2096,6 +1984,7 @@ async def show_main_menu(update, context, chat_id):
     main_text = (
         f"🎰 <b>Slot Bot - لوحة التحكم</b>\n"
         f"━━━━━━━━━━━━━━━━━\n"
+        f"⏱️ وقت التشغيل: {status['uptime']}\n"
         f"📧 الحسابات: <b>{status['total_accounts']}</b>\n"
         f"🟢 النشطة: <b>{status['running_accounts']}</b>\n"
         f"💎 الرصيد الكلي: <b>{status['total_balance']:,.0f}</b>\n"
@@ -2624,12 +2513,16 @@ def main():
     proxies = load_proxies()
     session_mode = proxies and SESSION_BASED_PROXY and is_session_proxy(proxies[0])
 
-    print("🎰 Slot Bot - النسخة النهائية")
+    print("🎰 Slot Bot - النسخة المدمجة النهائية")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"🌐 وضع البروكسي: {'Session' if session_mode else 'عادي'}")
     print(f"📊 البروكسيات: {len(proxies)}")
     print(f"🔔 الإشعارات: {'مفعّلة' if NOTIFY_ON_ERROR else 'معطّلة'}")
-    print("✅ بدون سحب | mail مؤقت | Recovery تلقائي")
+    print("✅ farm_ads من القديم (headers كاملة)")
+    print("✅ spin_once من القديم (lowercase auth)")
+    print("✅ انتظار قصير (0.3-0.7s)")
+    print("✅ بدون سحب")
+    print("✅ Recovery system")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     try:
